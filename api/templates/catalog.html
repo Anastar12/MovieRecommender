@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Каталог фильмов - Movie Recommender System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/main">
+                <i class="fas fa-film"></i> Movie Recommender System
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="/main">Главная</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/search">Поиск</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/recommendations">Рекомендации</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/catalog">Каталог</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/watched">Просмотренные</a>
+                    </li>
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle" href="#" id="userDropdown" role="button" data-bs-toggle="dropdown">
+                            <i class="fas fa-user"></i> {{ current_user }}
+                        </a>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li><a class="dropdown-item" href="#" id="logout-btn">
+                                <i class="fas fa-sign-out-alt"></i> Выйти
+                            </a></li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h1>Каталог фильмов</h1>
+            <button class="btn btn-filters" onclick="openFiltersModal()">
+                <i class="fas fa-filter"></i> Фильтры
+                <span id="filters-count" class="filters-active-indicator" style="display: none;">0</span>
+            </button>
+        </div>
+
+        <!-- Выбранные фильтры -->
+        <div id="selected-filters" class="selected-filters" style="display: none;">
+            <strong><i class="fas fa-filter"></i> Выбранные фильтры:</strong>
+            <div id="selected-filters-list" class="mt-2"></div>
+        </div>
+
+        <!-- Заголовок результатов -->
+        <div class="results-header">
+            <div>
+                <span id="results-count">0</span> фильмов найдено
+            </div>
+            <div>
+                <label class="me-2">Сортировать:</label>
+                <select id="sort-by" class="sort-select" onchange="displayMovies()">
+                    <option value="rating_desc">По рейтингу (убывание)</option>
+                    <option value="rating_asc">По рейтингу (возрастание)</option>
+                    <option value="year_desc">По году (новые)</option>
+                    <option value="year_asc">По году (старые)</option>
+                    <option value="title_asc">По названию (А-Я)</option>
+                    <option value="title_desc">По названию (Я-А)</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Результаты -->
+        <div id="movies-container">
+            <div class="loading text-center p-5">
+                <i class="fas fa-spinner fa-spin fa-3x"></i>
+                <p class="mt-3">Загрузка фильмов...</p>
+            </div>
+        </div>
+
+        <!-- Пагинация -->
+        <nav id="pagination-container">
+            <ul class="pagination" id="pagination"></ul>
+        </nav>
+    </div>
+
+    <!-- Модальное окно фильтров -->
+    <div class="modal fade filters-modal" id="filtersModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-filter"></i> Фильтры</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+
+                    <!-- Фильтр по жанрам -->
+                    <div class="filter-section">
+                        <h5><i class="fas fa-tags"></i> Жанры</h5>
+                        <div class="filter-search">
+                            <input type="text" id="genre-search" class="form-control" placeholder="Поиск жанра...">
+                        </div>
+                        <div id="genre-list" class="filter-options scrollable-filter">
+                            <div class="text-muted">Загрузка...</div>
+                        </div>
+                    </div>
+
+                    <!-- Фильтр по годам -->
+                    <div class="filter-section">
+                        <h5><i class="fas fa-calendar"></i> Годы</h5>
+                        <div id="year-list" class="filter-options scrollable-filter">
+                            <div class="text-muted">Загрузка...</div>
+                        </div>
+                    </div>
+
+                    <!-- Фильтр по странам -->
+                    <div class="filter-section">
+                        <h5><i class="fas fa-globe"></i> Страны</h5>
+                        <div class="filter-search">
+                            <input type="text" id="country-search" class="form-control" placeholder="Поиск страны...">
+                        </div>
+                        <div id="country-list" class="filter-options scrollable-filter">
+                            <div class="text-muted">Загрузка...</div>
+                        </div>
+                    </div>
+
+                    <!-- Фильтр по актерам -->
+                    <div class="filter-section">
+                        <h5><i class="fas fa-user"></i> Актеры</h5>
+                        <div class="filter-search">
+                            <input type="text" id="actor-search" class="form-control" placeholder="Поиск актера...">
+                        </div>
+                        <div id="actor-list" class="filter-options scrollable-filter">
+                            <div class="text-muted">Загрузка...</div>
+                        </div>
+                    </div>
+
+                    <!-- Фильтр по режиссерам -->
+                    <div class="filter-section">
+                        <h5><i class="fas fa-video"></i> Режиссеры</h5>
+                        <div class="filter-search">
+                            <input type="text" id="director-search" class="form-control" placeholder="Поиск режиссера...">
+                        </div>
+                        <div id="director-list" class="filter-options scrollable-filter">
+                            <div class="text-muted">Загрузка...</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-filter-reset" onclick="resetFilters()">
+                        <i class="fas fa-undo"></i> Сбросить все
+                    </button>
+                    <button type="button" class="btn btn-filter-apply" onclick="applyFiltersAndClose()">
+                        <i class="fas fa-check"></i> Применить
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно для деталей фильма -->
+    <div class="modal fade" id="movieModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Детали фильма</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="movie-modal-body">
+                    <!-- Контент загружается динамически -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        window.currentUserUrl = '{{ current_user_url }}';
+        window.currentUsername = '{{ current_user }}';
+    </script>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/catalog.js') }}"></script>
+</body>
+</html>

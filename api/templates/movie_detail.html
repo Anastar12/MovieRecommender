@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Детали фильма — Movie Recommender System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/main">
+                <i class="fas fa-film"></i> Movie Recommender System
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="/main">Главная</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/search">Поиск</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/recommendations">Рекомендации</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/catalog">Каталог</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/watched">Просмотренные</a>
+                    </li>
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle" href="#" id="userDropdown" role="button" data-bs-toggle="dropdown">
+                            <i class="fas fa-user"></i> {{ current_user }}
+                        </a>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li><a class="dropdown-item" href="#" id="logout-btn">
+                                <i class="fas fa-sign-out-alt"></i> Выйти
+                            </a></li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="sticky-back-btn">
+        <button class="btn-back-custom btn" onclick="window.history.back();">
+            <i class="fas fa-arrow-left"></i> Назад
+        </button>
+    </div>
+
+    <main id="movie-detail-root">
+        <div class="loading-spinner">
+            <i class="fas fa-spinner fa-pulse fa-3x"></i>
+            <p class="mt-3">Загружаем киноданные...</p>
+        </div>
+    </main>
+
+    <section id="similar-movies-block" style="display: none;">
+        <div class="similar-zone">
+            <div class="container">
+                <div class="similar-title">
+                    Похожие фильмы
+                </div>
+                <div id="similar-movies-grid-container"></div>
+            </div>
+        </div>
+    </section>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/movie-detail.js') }}"></script>
+</body>
+</html>
