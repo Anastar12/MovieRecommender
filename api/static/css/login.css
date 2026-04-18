@@ -1,0 +1,392 @@
+/* Основные цвета */
+:root {
+    --primary-color: #8bc34a;
+    --primary-dark: #689f38;
+    --bg-dark: #1a1a2e;
+    --bg-card: #16213e;
+    --bg-light: #0f0f1f;
+    --text-primary: #ffffff;
+    --text-secondary: #b0b0b0;
+    --text-muted: #6c6c7e;
+    --border-color: #2a2a3e;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background-color: var(--bg-dark);
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    color: var(--text-primary);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.login-container {
+    max-width: 450px;
+    width: 90%;
+    margin: 2rem auto;
+}
+
+.login-card {
+    background: var(--bg-card);
+    border-radius: 20px;
+    padding: 2rem;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(139, 195, 74, 0.2);
+}
+
+.login-header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.login-header i {
+    font-size: 3rem;
+    color: var(--primary-color);
+    margin-bottom: 1rem;
+}
+
+.login-header h1 {
+    color: var(--text-primary);
+    font-size: 1.8rem;
+    margin-bottom: 0.5rem;
+}
+
+.login-header p {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+.form-label {
+    color: var(--text-primary);
+    font-weight: 500;
+    margin-bottom: 0.5rem;
+}
+
+.btn-login {
+    background: linear-gradient(135deg, var(--primary-color) 0%, var(--primary-dark) 100%);
+    border: none;
+    color: var(--bg-dark);
+    font-weight: 600;
+    padding: 0.75rem;
+    border-radius: 12px;
+    width: 100%;
+    transition: all 0.3s;
+    margin-top: 1rem;
+}
+
+.btn-login:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(139, 195, 74, 0.3);
+}
+
+.loading-spinner {
+    display: none;
+    text-align: center;
+    margin-top: 1rem;
+}
+
+.loading-spinner i {
+    color: var(--primary-color);
+    font-size: 1.5rem;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.form-control, .form-select {
+    background-color: var(--bg-light);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+}
+
+.form-control:focus, .form-select:focus {
+    background-color: var(--bg-light);
+    border-color: var(--primary-color);
+    color: var(--text-primary);
+    box-shadow: 0 0 0 0.2rem rgba(139,195,74,0.25);
+}
+
+.form-text {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.btn-outline-success {
+    color: var(--primary-color);
+    border-color: var(--primary-color);
+}
+
+.btn-outline-success:hover {
+    background-color: var(--primary-color);
+    border-color: var(--primary-color);
+    color: var(--bg-dark);
+}
+
+hr {
+    border-color: var(--border-color);
+}
+
+.text-muted {
+    color: var(--text-muted) !important;
+}
+
+.login-mode-toggle {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+    background: var(--bg-light);
+    border-radius: 12px;
+    padding: 0.25rem;
+}
+
+.mode-btn {
+    flex: 1;
+    background: transparent;
+    border: none;
+    padding: 0.5rem;
+    border-radius: 10px;
+    color: var(--text-secondary);
+    transition: all 0.3s;
+    cursor: pointer;
+}
+
+.mode-btn.active {
+    background: var(--primary-color);
+    color: var(--bg-dark);
+}
+
+.mode-btn i {
+    margin-right: 0.5rem;
+}
+
+.username-input-group {
+    display: none;
+}
+
+.username-input-group.active {
+    display: block;
+}
+
+.user-select-group {
+    display: block;
+}
+
+.user-select-group.hide {
+    display: none;
+}
+
+#createUserModal .modal-content {
+    background: #16213e !important;
+    border: 2px solid #8bc34a !important;
+    border-radius: 20px !important;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5) !important;
+}
+
+#createUserModal .modal-header {
+    border-bottom: 1px solid rgba(139, 195, 74, 0.3) !important;
+    background: transparent !important;
+    padding: 1rem 1.5rem !important;
+}
+
+#createUserModal .modal-header .modal-title {
+    color: var(--text-primary) !important;
+    font-size: 1.25rem !important;
+}
+
+#createUserModal .modal-header .btn-close {
+    filter: brightness(0) invert(1) !important;
+    opacity: 0.8 !important;
+    background-color: transparent !important;
+}
+
+#createUserModal .modal-body {
+    padding: 1.5rem !important;
+    color: var(--text-primary) !important;
+}
+
+#createUserModal .modal-footer {
+    border-top: 1px solid rgba(139, 195, 74, 0.3) !important;
+    background: transparent !important;
+    padding: 1rem 1.5rem !important;
+}
+
+.modal-backdrop {
+    background-color: rgba(0, 0, 0, 0.85) !important;
+}
+
+body.modal-open {
+    overflow: hidden !important;
+    padding-right: 0 !important;
+}
+
+.alert {
+    border-radius: 10px;
+}
+
+/* Добавьте или замените эти стили в вашем файле login.css */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background-color: var(--bg-dark);
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    color: var(--text-primary);
+    height: 100vh; /* Фиксированная высота на весь экран */
+    overflow: hidden; /* Убираем скролл у body */
+    display: flex;
+    align-items: center; /* Вертикальное центрирование */
+    justify-content: center; /* Горизонтальное центрирование */
+}
+
+/* Стили для страницы входа */
+.login-container {
+    max-width: 450px;
+    width: 90%;
+    margin: 0; /* Убираем отступы */
+    padding: 0;
+}
+
+.login-card {
+    background: var(--bg-card);
+    border-radius: 20px;
+    padding: 2rem;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(139, 195, 74, 0.2);
+    max-height: 95vh; /* Ограничиваем высоту карточки */
+    overflow-y: auto; /* Добавляем скролл только внутри карточки если нужно */
+}
+
+/* Стилизуем скролл внутри карточки (опционально) */
+.login-card::-webkit-scrollbar {
+    width: 6px;
+}
+
+.login-card::-webkit-scrollbar-track {
+    background: var(--bg-light);
+    border-radius: 3px;
+}
+
+.login-card::-webkit-scrollbar-thumb {
+    background: var(--primary-color);
+    border-radius: 3px;
+}
+
+/* Уменьшаем отступы для компактности */
+.login-header {
+    text-align: center;
+    margin-bottom: 1.5rem; /* Уменьшено с 2rem */
+}
+
+.login-header i {
+    font-size: 2.5rem; /* Уменьшено с 3rem */
+    color: var(--primary-color);
+    margin-bottom: 0.75rem;
+}
+
+.login-header h1 {
+    color: var(--text-primary);
+    font-size: 1.6rem; /* Уменьшено с 1.8rem */
+    margin-bottom: 0.25rem;
+}
+
+.login-header p {
+    color: var(--text-secondary);
+    font-size: 0.85rem; /* Уменьшено с 0.9rem */
+}
+
+/* Уменьшаем отступы у формы */
+#login-form {
+    margin-bottom: 0;
+}
+
+.login-mode-toggle {
+    margin-bottom: 1rem; /* Уменьшено с 1.5rem */
+    padding: 0.2rem; /* Уменьшено с 0.25rem */
+}
+
+.mode-btn {
+    padding: 0.4rem; /* Уменьшено с 0.5rem */
+    font-size: 0.9rem;
+}
+
+.form-label {
+    margin-bottom: 0.35rem; /* Уменьшено с 0.5rem */
+    font-size: 0.9rem;
+}
+
+.form-control, .form-select {
+    font-size: 0.85rem;
+    padding: 0.5rem 0.75rem; /* Уменьшены отступы */
+}
+
+.form-text {
+    font-size: 0.7rem;
+    margin-top: 0.25rem;
+}
+
+.btn-login {
+    padding: 0.6rem; /* Уменьшено с 0.75rem */
+    margin-top: 0.75rem; /* Уменьшено с 1rem */
+    font-size: 0.95rem;
+}
+
+.text-center.mt-3 {
+    margin-top: 0.75rem !important; /* Уменьшено с 1rem */
+}
+
+hr {
+    margin: 0.75rem 0; /* Уменьшены отступы */
+}
+
+.btn-outline-success {
+    padding: 0.4rem 0.75rem; /* Уменьшены отступы */
+    font-size: 0.85rem;
+}
+
+/* Для очень маленьких экранов */
+@media (max-height: 600px) {
+    .login-card {
+        padding: 1.25rem; /* Уменьшаем padding */
+    }
+
+    .login-header {
+        margin-bottom: 1rem;
+    }
+
+    .login-header i {
+        font-size: 2rem;
+        margin-bottom: 0.5rem;
+    }
+
+    .login-header h1 {
+        font-size: 1.3rem;
+    }
+
+    .login-header p {
+        font-size: 0.75rem;
+    }
+
+    .login-mode-toggle {
+        margin-bottom: 0.75rem;
+    }
+
+    .mode-btn {
+        padding: 0.3rem;
+        font-size: 0.8rem;
+    }
+}

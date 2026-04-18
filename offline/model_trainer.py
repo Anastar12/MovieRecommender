@@ -1,3 +1,4 @@
+import hashlib
 import numpy as np
 from scipy.sparse import csr_matrix, load_npz, save_npz
 from sklearn.decomposition import TruncatedSVD, NMF
@@ -36,6 +37,28 @@ class ModelTrainer:
         self.item_factors = None
         self.user_factors_nmf = None
         self.item_factors_nmf = None
+
+        # Система версионирования
+        from offline.model_versioning import ModelVersioning
+        self.versioning = ModelVersioning(models_path)
+
+    def _get_model_signature(self) -> Dict[str, str]:
+        """Получает сигнатуру моделей для проверки целостности"""
+        signature = {}
+
+        model_files = [
+            'svd_model.pkl', 'user_factors.npy', 'item_factors.npy',
+            'nmf_model.pkl', 'als_model.pkl', 'rating_predictor.pkl',
+            'ranking_model.pkl', 'nn_model.pkl'
+        ]
+
+        for filename in model_files:
+            filepath = os.path.join(self.models_path, filename)
+            if os.path.exists(filepath):
+                with open(filepath, 'rb') as f:
+                    signature[filename] = hashlib.md5(f.read()).hexdigest()
+
+        return signature
 
     async def build_svd_model(self, user_item_matrix: csr_matrix, n_components: int = None) -> Dict:
         """Построение SVD модели"""
@@ -361,84 +384,120 @@ class ModelTrainer:
 
         return results
 
-    def save_models(self):
-        """Сохранение моделей"""
+    def save_models(self, data_snapshot: Dict[str, str] = None):
+        """Сохранение моделей с версионированием"""
         logger.info("Сохранение моделей...")
 
+        # Сохраняем модели
         if self.svd_model is not None:
             with open(f'{self.models_path}svd_model.pkl', 'wb') as f:
                 pickle.dump(self.svd_model, f)
             np.save(f'{self.models_path}user_factors.npy', self.user_factors)
             np.save(f'{self.models_path}item_factors.npy', self.item_factors)
+            logger.info("SVD модель сохранена")
 
         if self.nmf_model is not None:
             with open(f'{self.models_path}nmf_model.pkl', 'wb') as f:
                 pickle.dump(self.nmf_model, f)
-            np.save(f'{self.models_path}user_factors_nmf.npy', self.user_factors_nmf)
-            np.save(f'{self.models_path}item_factors_nmf.npy', self.item_factors_nmf)
+            if self.user_factors_nmf is not None:
+                np.save(f'{self.models_path}user_factors_nmf.npy', self.user_factors_nmf)
+                np.save(f'{self.models_path}item_factors_nmf.npy', self.item_factors_nmf)
+            logger.info("NMF модель сохранена")
 
         if self.als_model is not None:
             with open(f'{self.models_path}als_model.pkl', 'wb') as f:
                 pickle.dump(self.als_model, f)
+            logger.info("ALS модель сохранена")
 
         if self.rating_predictor is not None:
             with open(f'{self.models_path}rating_predictor.pkl', 'wb') as f:
                 pickle.dump(self.rating_predictor, f)
+            logger.info("Модель предсказания сохранена")
 
         if self.ranking_model is not None:
             with open(f'{self.models_path}ranking_model.pkl', 'wb') as f:
                 pickle.dump(self.ranking_model, f)
+            logger.info("Модель ранжирования сохранена")
 
         if self.nn_model is not None:
             with open(f'{self.models_path}nn_model.pkl', 'wb') as f:
                 pickle.dump(self.nn_model, f)
+            logger.info("Индекс схожести сохранен")
 
+        # Сохраняем информацию о версии
+        version_info = {
+            'version': datetime.now().strftime('%Y%m%d_%H%M%S'),
+            'data_snapshot': data_snapshot or {},
+            'model_files': self.versioning.get_model_files()
+        }
+
+        self.versioning.save_version_info(version_info)
         logger.info("Модели сохранены")
 
-    def load_models(self) -> bool:
-        """Загрузка сохраненных моделей"""
+    def load_models(self, data_snapshot: Dict[str, str] = None) -> bool:
+        """Загрузка моделей с проверкой актуальности"""
+
+        # Проверяем, нужно ли переобучать модели
+        if data_snapshot:
+            if not self.versioning.are_models_valid(data_snapshot):
+                logger.info("Данные изменились или модели отсутствуют, требуется переобучение")
+                return False
+        else:
+            # Если нет снапшота для проверки, проверяем только существование файлов
+            if self.versioning.check_model_files_exist():
+                logger.info("Файлы моделей существуют, пробуем загрузить")
+            else:
+                logger.info("Файлы моделей отсутствуют, требуется обучение")
+                return False
+
         try:
-            import os
-
-            # Проверка существования файлов
-            required_files = ['svd_model.pkl', 'user_factors.npy', 'item_factors.npy']
-            for file in required_files:
-                if not os.path.exists(f'{self.models_path}{file}'):
-                    return False
-
             # Загрузка SVD
-            with open(f'{self.models_path}svd_model.pkl', 'rb') as f:
-                self.svd_model = pickle.load(f)
-            self.user_factors = np.load(f'{self.models_path}user_factors.npy')
-            self.item_factors = np.load(f'{self.models_path}item_factors.npy')
+            svd_path = f'{self.models_path}svd_model.pkl'
+            if os.path.exists(svd_path):
+                with open(svd_path, 'rb') as f:
+                    self.svd_model = pickle.load(f)
+                self.user_factors = np.load(f'{self.models_path}user_factors.npy')
+                self.item_factors = np.load(f'{self.models_path}item_factors.npy')
+                logger.info("SVD модель загружена")
 
             # Загрузка NMF
-            if os.path.exists(f'{self.models_path}nmf_model.pkl'):
-                with open(f'{self.models_path}nmf_model.pkl', 'rb') as f:
+            nmf_path = f'{self.models_path}nmf_model.pkl'
+            if os.path.exists(nmf_path):
+                with open(nmf_path, 'rb') as f:
                     self.nmf_model = pickle.load(f)
-                self.user_factors_nmf = np.load(f'{self.models_path}user_factors_nmf.npy')
-                self.item_factors_nmf = np.load(f'{self.models_path}item_factors_nmf.npy')
+                if os.path.exists(f'{self.models_path}user_factors_nmf.npy'):
+                    self.user_factors_nmf = np.load(f'{self.models_path}user_factors_nmf.npy')
+                    self.item_factors_nmf = np.load(f'{self.models_path}item_factors_nmf.npy')
+                logger.info("NMF модель загружена")
 
             # Загрузка ALS
-            if os.path.exists(f'{self.models_path}als_model.pkl'):
-                with open(f'{self.models_path}als_model.pkl', 'rb') as f:
+            als_path = f'{self.models_path}als_model.pkl'
+            if os.path.exists(als_path):
+                with open(als_path, 'rb') as f:
                     self.als_model = pickle.load(f)
+                logger.info("ALS модель загружена")
 
             # Загрузка моделей предсказания
-            if os.path.exists(f'{self.models_path}rating_predictor.pkl'):
-                with open(f'{self.models_path}rating_predictor.pkl', 'rb') as f:
+            rating_path = f'{self.models_path}rating_predictor.pkl'
+            if os.path.exists(rating_path):
+                with open(rating_path, 'rb') as f:
                     self.rating_predictor = pickle.load(f)
+                logger.info("Модель предсказания загружена")
 
-            if os.path.exists(f'{self.models_path}ranking_model.pkl'):
-                with open(f'{self.models_path}ranking_model.pkl', 'rb') as f:
+            ranking_path = f'{self.models_path}ranking_model.pkl'
+            if os.path.exists(ranking_path):
+                with open(ranking_path, 'rb') as f:
                     self.ranking_model = pickle.load(f)
+                logger.info("Модель ранжирования загружена")
 
             # Загрузка индекса схожести
-            if os.path.exists(f'{self.models_path}nn_model.pkl'):
-                with open(f'{self.models_path}nn_model.pkl', 'rb') as f:
+            nn_path = f'{self.models_path}nn_model.pkl'
+            if os.path.exists(nn_path):
+                with open(nn_path, 'rb') as f:
                     self.nn_model = pickle.load(f)
+                logger.info("Индекс схожести загружен")
 
-            logger.info("Модели загружены")
+            logger.info("Все модели успешно загружены")
             return True
 
         except Exception as e:

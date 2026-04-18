@@ -78,6 +78,43 @@ class DataPipeline:
             logger.error(f"Ошибка выполнения запроса: {e}")
             return []
 
+    @staticmethod
+    def _normalize_user_url(user_url: str) -> str:
+        """Приводит user_url к единому виду для сравнения."""
+        if not user_url:
+            return ''
+
+        normalized = str(user_url).strip()
+        normalized = normalized.split('?', 1)[0]
+        normalized = normalized.replace('https://www.imdb.com', '')
+        normalized = normalized.replace('http://www.imdb.com', '')
+        normalized = re.sub(r'/+', '/', normalized)
+        if normalized and not normalized.startswith('/'):
+            normalized = f'/{normalized}'
+        normalized = normalized.rstrip('/')
+        return normalized
+
+    @staticmethod
+    def _extract_movie_id(movie_url: str) -> Optional[str]:
+        """Извлекает movie_id (tt...) из разных форматов URL."""
+        if not movie_url:
+            return None
+
+        value = str(movie_url).strip()
+        # Частый формат: /title/tt1234567/
+        match = re.search(r'/title/([^/?#]+)/?', value)
+        if match:
+            movie_id = match.group(1).strip()
+            if movie_id:
+                return movie_id
+
+        # Fallback: ищем tt-id в любом месте строки
+        match = re.search(r'(tt\d{5,12})', value)
+        if match:
+            return match.group(1).strip()
+
+        return None
+
     def _load_table(self, table_name: str, columns: List[str] = None) -> pd.DataFrame:
         """Загружает таблицу из БД"""
         if not self.engine:
@@ -159,6 +196,18 @@ class DataPipeline:
             self.reviews_df['rating'] = pd.to_numeric(self.reviews_df['rating'], errors='coerce')
 
         # После загрузки reviews_df
+        if len(self.reviews_df) > 0 and 'movie_review_url' in self.reviews_df.columns:
+            self.reviews_df['movie_id'] = self.reviews_df['movie_review_url'].str.extract(r'/title/(tt\d+)/')
+            self.reviews_df['user_url_clean'] = self.reviews_df['user_url'].str.split('?').str[0]
+            self.reviews_df['user_url_clean'] = self.reviews_df['user_url_clean'].str.replace(
+                'https://www.imdb.com', '').str.replace('http://www.imdb.com', '').str.strip('/')
+            self.reviews_df['rating'] = pd.to_numeric(self.reviews_df['rating'], errors='coerce')
+
+            # Удаляем строки с отсутствующим movie_id
+            self.reviews_df = self.reviews_df.dropna(subset=['movie_id'])
+
+            logger.info(f"Извлечено {len(self.reviews_df)} ревью с movie_id")
+
         if len(self.reviews_df) > 0 and 'user_url' in self.reviews_df.columns:
             # Нормализуем user_url
             def normalize_user_url(url):
@@ -541,3 +590,485 @@ class DataPipeline:
             pickle.dump(metadata, f)
 
         logger.info("Данные сохранены")
+
+    def get_data_hashes(self) -> Dict[str, str]:
+        """Вычисляет хеши для всех источников данных"""
+        hashes = {}
+
+        # Хеш таблицы movies
+        if self.movies_df is not None and len(self.movies_df) > 0:
+            movies_hash = hashlib.md5(
+                (str(len(self.movies_df)) +
+                 str(self.movies_df['movie_id'].nunique()) +
+                 str(self.movies_df['year'].nunique())).encode()
+            ).hexdigest()
+            hashes['movies'] = movies_hash
+
+        # Хеш таблицы reviews
+        if self.reviews_df is not None and len(self.reviews_df) > 0:
+            reviews_hash = hashlib.md5(
+                (str(len(self.reviews_df)) +
+                 str(self.reviews_df['user_url'].nunique()) +
+                 str(self.reviews_df['movie_id'].nunique())).encode()
+            ).hexdigest()
+            hashes['reviews'] = reviews_hash
+
+        # Хеш таблицы users
+        if self.user_main_df is not None and len(self.user_main_df) > 0:
+            users_hash = hashlib.md5(
+                (str(len(self.user_main_df)) +
+                 str(self.user_main_df['user_url'].nunique())).encode()
+            ).hexdigest()
+            hashes['users'] = users_hash
+
+        # Хеш таблицы genres
+        if self.genres_df is not None and len(self.genres_df) > 0:
+            genres_hash = hashlib.md5(
+                (str(len(self.genres_df)) +
+                 str(self.genres_df['genre_en'].nunique())).encode()
+            ).hexdigest()
+            hashes['genres'] = genres_hash
+
+        # Добавляем timestamp последнего обновления БД
+        try:
+            if self.connection:
+                with self.connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT MAX(COALESCE(pg_stat_all_tables.last_vacuum, '1900-01-01')) as last_change
+                        FROM pg_stat_all_tables
+                        WHERE schemaname = 'db'
+                    """)
+                    result = cursor.fetchone()
+                    if result and result[0]:
+                        hashes['db_last_change'] = hashlib.md5(str(result[0]).encode()).hexdigest()
+        except Exception as e:
+            logger.error(f"Ошибка получения timestamp БД: {e}")
+
+        return hashes
+
+    async def load_user_data(self) -> bool:
+        """Загрузка данных пользователей"""
+        logger.info("Загрузка данных пользователей...")
+
+        if not self._create_connection():
+            return False
+
+        # Загружаем пользователей
+        self.user_main_df = self._load_table('users')
+
+        # Загружаем отзывы
+        self.reviews_df = self._load_table('reviews')
+
+        # Загружаем просмотренные фильмы
+        watched_df = self._load_table('user_watched')
+        if not watched_df.empty:
+            self.user_watched_df = watched_df
+
+        # Загружаем избранное
+        favorites_df = self._load_table('user_favorites')
+        if not favorites_df.empty:
+            self.user_favorites_df = favorites_df
+
+        logger.info(f"Загружено: {len(self.user_main_df)} пользователей, "
+                    f"{len(self.reviews_df)} отзывов, "
+                    f"{len(watched_df) if hasattr(self, 'user_watched_df') else 0} просмотренных, "
+                    f"{len(favorites_df) if hasattr(self, 'user_favorites_df') else 0} в избранном")
+
+        return True
+
+    async def save_user_rating(self, user_url: str, movie_id: str, rating: float,
+                               review_text: str = None, review_title: str = None) -> bool:
+        """Сохранение оценки пользователя в БД"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return False
+
+            import hashlib
+            from datetime import datetime
+
+            # Генерируем review_url
+            review_hash = hashlib.md5(f"{user_url}_{movie_id}_{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+            review_url = f"/review/{review_hash}"
+            movie_review_url = f"/title/{movie_id}/"
+
+            with self.connection.cursor() as cursor:
+                # Проверяем, существует ли уже оценка
+                cursor.execute("""
+                    SELECT review_url FROM db.reviews 
+                    WHERE user_url = %s AND movie_review_url = %s
+                """, (user_url, movie_review_url))
+
+                existing = cursor.fetchone()
+
+                if existing:
+                    # Обновляем существующую оценку
+                    cursor.execute("""
+                        UPDATE db.reviews 
+                        SET rating = %s, review_text = %s, review_title = %s, date = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_url = %s AND movie_review_url = %s
+                        RETURNING review_url
+                    """, (rating, review_text, review_title, datetime.now().date(), user_url, movie_review_url))
+                else:
+                    # Вставляем новую оценку
+                    cursor.execute("""
+                        INSERT INTO db.reviews (review_url, movie_review_url, user_url, review_title, rating, date, review_text)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                    review_url, movie_review_url, user_url, review_title, rating, datetime.now().date(), review_text))
+
+                self.connection.commit()
+
+                # Обновляем статистику пользователя
+                await self._update_user_stats(user_url)
+
+                logger.info(f"Сохранена оценка {rating} для пользователя {user_url} к фильму {movie_id}")
+                return True
+
+        except Exception as e:
+            logger.error(f"Ошибка сохранения оценки: {e}")
+            self.connection.rollback()
+            return False
+
+    async def add_to_watched(self, user_url: str, movie_id: str) -> bool:
+        """Добавление фильма в просмотренные"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return False
+
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO db.user_watched (user_url, movie_id, added_date)
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_url, movie_id) DO NOTHING
+                """, (user_url, movie_id))
+
+                self.connection.commit()
+                logger.info(f"Фильм {movie_id} добавлен в просмотренные для {user_url}")
+                return True
+
+        except Exception as e:
+            logger.error(f"Ошибка добавления в просмотренные: {e}")
+            self.connection.rollback()
+            return False
+
+    async def add_to_favorites(self, user_url: str, movie_id: str) -> bool:
+        """Добавление фильма в избранное"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return False
+
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO db.user_favorites (user_url, movie_id, added_date)
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_url, movie_id) DO NOTHING
+                """, (user_url, movie_id))
+
+                self.connection.commit()
+                logger.info(f"Фильм {movie_id} добавлен в избранное для {user_url}")
+                return True
+
+        except Exception as e:
+            logger.error(f"Ошибка добавления в избранное: {e}")
+            self.connection.rollback()
+            return False
+
+    async def remove_from_favorites(self, user_url: str, movie_id: str) -> bool:
+        """Удаление фильма из избранного"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return False
+
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    DELETE FROM db.user_favorites 
+                    WHERE user_url = %s AND movie_id = %s
+                """, (user_url, movie_id))
+
+                self.connection.commit()
+                logger.info(f"Фильм {movie_id} удален из избранного для {user_url}")
+                return True
+
+        except Exception as e:
+            logger.error(f"Ошибка удаления из избранного: {e}")
+            self.connection.rollback()
+            return False
+
+    async def get_user_favorites(self, user_url: str) -> List[str]:
+        """Получение списка избранных фильмов пользователя"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return []
+
+            normalized_user_url = self._normalize_user_url(user_url)
+
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT movie_id FROM db.user_favorites 
+                    WHERE user_url = %s
+                       OR regexp_replace(
+                            replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
+                            '/+$',
+                            ''
+                        ) = %s
+                    ORDER BY added_date DESC
+                """, (user_url, normalized_user_url))
+
+                return [row[0] for row in cursor.fetchall()]
+
+        except Exception as e:
+            logger.error(f"Ошибка получения избранного: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return []
+
+    async def get_user_watched(self, user_url: str) -> List[str]:
+        """Получение списка просмотренных фильмов пользователя"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return []
+
+            normalized_user_url = self._normalize_user_url(user_url)
+
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT movie_id FROM db.user_watched 
+                    WHERE user_url = %s
+                       OR regexp_replace(
+                            replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
+                            '/+$',
+                            ''
+                        ) = %s
+                    ORDER BY added_date DESC
+                """, (user_url, normalized_user_url))
+
+                return [row[0] for row in cursor.fetchall()]
+
+        except Exception as e:
+            logger.error(f"Ошибка получения просмотренных: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return []
+
+    async def get_user_reviewed_movies(self, user_url: str) -> List[Dict]:
+        """Получение просмотренных фильмов из отзывов пользователя."""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return []
+
+            normalized_user_url = self._normalize_user_url(user_url)
+
+            with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT
+                        r.movie_review_url,
+                        r.rating,
+                        r.review_text,
+                        r.date,
+                        m.title,
+                        m.title_ru,
+                        m.year
+                    FROM db.reviews r
+                    LEFT JOIN db.movies m ON m.movie_url = r.movie_review_url
+                    WHERE user_url = %s
+                       OR regexp_replace(
+                            replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
+                            '/+$',
+                            ''
+                        ) = %s
+                    ORDER BY r.date DESC NULLS LAST
+                """, (user_url, normalized_user_url))
+                rows = cursor.fetchall()
+
+            reviewed_movies = []
+
+            for row in rows:
+                movie_review_url = row.get('movie_review_url') if row else None
+                if not movie_review_url:
+                    continue
+
+                movie_id = self._extract_movie_id(movie_review_url)
+                if not movie_id:
+                    continue
+
+                reviewed_movies.append({
+                    'movie_id': movie_id,
+                    'rating': row.get('rating'),
+                    'review_text': row.get('review_text', ''),
+                    'date': row.get('date'),
+                    'title': row.get('title', ''),
+                    'title_ru': row.get('title_ru', ''),
+                    'year': row.get('year')
+                })
+
+            return reviewed_movies
+
+        except Exception as e:
+            logger.error(f"Ошибка получения просмотренных из отзывов: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return []
+
+    async def get_user_rating(self, user_url: str, movie_id: str) -> Optional[Dict]:
+        """Получение оценки пользователя для фильма"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return None
+
+            movie_review_url = f"/title/{movie_id}/"
+            normalized_user_url = self._normalize_user_url(user_url)
+
+            with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT rating, review_text, review_title, date 
+                    FROM db.reviews 
+                    WHERE (user_url = %s
+                           OR regexp_replace(
+                                replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
+                                '/+$',
+                                ''
+                           ) = %s)
+                      AND movie_review_url = %s
+                """, (user_url, normalized_user_url, movie_review_url))
+
+                result = cursor.fetchone()
+                if result:
+                    return dict(result)
+                return None
+
+        except Exception as e:
+            logger.error(f"Ошибка получения оценки: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return None
+
+    async def check_movie_watched(self, user_url: str, movie_id: str) -> bool:
+        """Проверка, добавлен ли фильм в просмотренные"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return False
+
+            normalized_user_url = self._normalize_user_url(user_url)
+
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 1 FROM db.user_watched 
+                    WHERE (user_url = %s
+                           OR regexp_replace(
+                                replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
+                                '/+$',
+                                ''
+                           ) = %s)
+                      AND movie_id = %s
+                """, (user_url, normalized_user_url, movie_id))
+
+                return cursor.fetchone() is not None
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки просмотра: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return False
+
+    async def check_movie_favorite(self, user_url: str, movie_id: str) -> bool:
+        """Проверка, добавлен ли фильм в избранное"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return False
+
+            normalized_user_url = self._normalize_user_url(user_url)
+
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 1 FROM db.user_favorites 
+                    WHERE (user_url = %s
+                           OR regexp_replace(
+                                replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
+                                '/+$',
+                                ''
+                           ) = %s)
+                      AND movie_id = %s
+                """, (user_url, normalized_user_url, movie_id))
+
+                return cursor.fetchone() is not None
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки избранного: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return False
+
+    async def create_user(self, username: str, user_url: str = None) -> Optional[Dict]:
+        """Создание нового пользователя"""
+        try:
+            if not self.connection:
+                if not self._create_connection():
+                    return None
+
+            import re
+            from datetime import datetime
+
+            if not user_url:
+                user_url_base = re.sub(r'[^a-zA-Z0-9]', '_', username.lower())
+                user_url = f"/user/{user_url_base}"
+
+                # Проверяем уникальность
+                with self.connection.cursor() as cursor:
+                    cursor.execute("SELECT user_url FROM db.users WHERE user_url = %s", (user_url,))
+                    if cursor.fetchone():
+                        import time
+                        user_url = f"/user/{user_url_base}_{int(time.time())}"
+
+            with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    INSERT INTO db.users (user_url, username, joined, ratings_count, created_at)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    RETURNING user_url, username, joined, ratings_count
+                """, (user_url, username, datetime.now().date(), 0))
+
+                self.connection.commit()
+                result = cursor.fetchone()
+
+                logger.info(f"Создан новый пользователь: {username} ({user_url})")
+                return dict(result) if result else None
+
+        except Exception as e:
+            logger.error(f"Ошибка создания пользователя: {e}")
+            self.connection.rollback()
+            return None
+
+    async def _update_user_stats(self, user_url: str):
+        """Обновление статистики пользователя"""
+        try:
+            with self.connection.cursor() as cursor:
+                # Подсчитываем количество оценок
+                cursor.execute("""
+                    SELECT COUNT(*) as ratings_count, AVG(rating) as avg_rating
+                    FROM db.reviews 
+                    WHERE user_url = %s
+                """, (user_url,))
+
+                result = cursor.fetchone()
+                ratings_count = result[0] if result else 0
+
+                # Обновляем пользователя
+                cursor.execute("""
+                    UPDATE db.users 
+                    SET ratings_count = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_url = %s
+                """, (ratings_count, user_url))
+
+                self.connection.commit()
+
+        except Exception as e:
+            logger.error(f"Ошибка обновления статистики: {e}")

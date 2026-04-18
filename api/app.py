@@ -6,6 +6,12 @@ import pandas as pd
 import numpy as np
 import os
 from urllib.parse import unquote
+import math
+import json
+import re
+from datetime import datetime
+import csv
+from sqlalchemy.dialects.postgresql import psycopg2
 
 from core.config import AppConfig
 from offline.data_pipeline import DataPipeline
@@ -63,6 +69,16 @@ feedback_logger = FeedbackLogger(log_path='logs/')
 # Глобальные переменные для совместимости со старыми эндпоинтами
 recommender = None
 reviews_df = None
+
+
+def handle_nan(obj):
+    """Обработчик NaN значений для JSON сериализации"""
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return None
+    if pd.isna(obj):
+        return None
+    return obj
 
 
 class ModelsProvider:
@@ -312,6 +328,10 @@ class ModelsProvider:
 
                     return genres_tree
 
+                def get_similar_movies(self, movie_id, n=20):
+                    """Прокси для похожих фильмов через ModelsProvider."""
+                    return self.provider.get_similar_movies(movie_id, n)
+
             recommender = RecommenderWrapper(self)
 
             # Загрузка reviews_df для совместимости
@@ -472,6 +492,7 @@ class DataProvider:
 
     def __init__(self, data_pipeline: DataPipeline):
         self.data = data_pipeline
+        self.connection = data_pipeline.connection
 
         # Загрузка данных
         movies_path = f'{self.data.models_path}movies_df.pkl'
@@ -536,67 +557,96 @@ class DataProvider:
         ]
 
     def get_user_watched_movies(self, user_id: str) -> List[Dict]:
-        """Получение просмотренных фильмов пользователя"""
-        global reviews_df
+        """Получение просмотренных фильмов пользователя из PostgreSQL"""
+        try:
+            if not self.connection:
+                return []
 
-        if reviews_df is None:
-            return []
+            async def get_watched():
+                return await self.data.get_user_watched(user_id)
 
-        # Нормализуем user_id для сравнения
-        def normalize_url(url):
-            if not url:
-                return ''
-            url = str(url).strip()
-            # Убираем префиксы
-            url = url.replace('https://www.imdb.com', '')
-            url = url.replace('http://www.imdb.com', '')
-            # Убираем trailing slash
-            url = url.rstrip('/')
-            # Убираем параметры запроса
-            url = url.split('?')[0]
-            return url
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            watched_ids = loop.run_until_complete(get_watched())
+            loop.close()
 
-        normalized_user_id = normalize_url(user_id)
-
-        # Пробуем разные варианты поиска
-        user_reviews = None
-
-        # Вариант 1: по user_url_clean
-        if 'user_url_clean' in reviews_df.columns:
-            user_reviews = reviews_df[reviews_df['user_url_clean'] == normalized_user_id]
-
-        # Вариант 2: по user_url_normalized
-        if (user_reviews is None or len(user_reviews) == 0) and 'user_url_normalized' in reviews_df.columns:
-            user_reviews = reviews_df[reviews_df['user_url_normalized'] == normalized_user_id]
-
-        # Вариант 3: по user_url (содержит)
-        if (user_reviews is None or len(user_reviews) == 0) and 'user_url' in reviews_df.columns:
-            user_reviews = reviews_df[reviews_df['user_url'].str.contains(normalized_user_id, na=False)]
-
-        # Вариант 4: по части URL
-        if (user_reviews is None or len(user_reviews) == 0):
-            # Извлекаем ID пользователя
-            user_id_part = normalized_user_id.split('/')[-1] if '/' in normalized_user_id else normalized_user_id
-            if 'user_url' in reviews_df.columns:
-                user_reviews = reviews_df[reviews_df['user_url'].str.contains(user_id_part, na=False)]
-            elif 'user_url_clean' in reviews_df.columns:
-                user_reviews = reviews_df[reviews_df['user_url_clean'].str.contains(user_id_part, na=False)]
-
-        if user_reviews is None or len(user_reviews) == 0:
-            return []
-
-        watched = []
-        for _, review in user_reviews.iterrows():
-            movie_id = review.get('movie_id')
-            if pd.notna(movie_id):
-                watched.append({
-                    'movie_id': str(movie_id),
-                    'rating': review.get('rating'),
-                    'date': review.get('date'),
-                    'review_text': review.get('review_text')
+            watched_entries = []
+            for movie_id in watched_ids:
+                watched_entries.append({
+                    'movie_id': movie_id,
+                    'rating': None,
+                    'review_text': '',
+                    'date': None
                 })
 
-        return watched
+            # Fallback: если таблица user_watched пустая, берем фильмы из отзывов.
+            if not watched_entries:
+                async def get_reviewed_movies():
+                    return await self.data.get_user_reviewed_movies(user_id)
+
+                loop_fallback = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop_fallback)
+                watched_entries = loop_fallback.run_until_complete(get_reviewed_movies())
+                loop_fallback.close()
+
+                logger.info(f"Для {user_id} user_watched пуст, загружено {len(watched_entries)} фильмов из reviews")
+
+            # Обогащаем данными о фильмах
+            watched = []
+            for watched_item in watched_entries:
+                movie_id = watched_item.get('movie_id')
+                if not movie_id:
+                    continue
+
+                details = recommender.get_movie_details(movie_id) if recommender else None
+                if not details:
+                    # Для фильмов, которых нет в локальном каталоге, возвращаем базовую карточку.
+                    fallback_title = watched_item.get('title_ru') or watched_item.get('title') or f"Фильм {movie_id}"
+                    details = {
+                        'movie_id': movie_id,
+                        'title': fallback_title,
+                        'title_ru': watched_item.get('title_ru') or watched_item.get('title') or fallback_title,
+                        'year': watched_item.get('year') or '',
+                        'genre': '',
+                        'genres': [],
+                        'imdb_rating': None,
+                        'plot': '',
+                        'plot_ru': '',
+                        'directors': [],
+                        'directors_ru': [],
+                        'actors': [],
+                        'actors_ru': []
+                    }
+
+                rating_data = {
+                    'rating': watched_item.get('rating'),
+                    'review_text': watched_item.get('review_text'),
+                    'date': watched_item.get('date')
+                }
+
+                # Если у записи из user_watched нет оценки, достаём из reviews.
+                if rating_data['rating'] is None and not rating_data['review_text'] and not rating_data['date']:
+                    async def get_rating():
+                        return await self.data.get_user_rating(user_id, movie_id)
+
+                    loop2 = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop2)
+                    rating_data = loop2.run_until_complete(get_rating())
+                    loop2.close()
+
+                if rating_data:
+                    details['rating'] = rating_data.get('rating')
+                    details['user_rating'] = rating_data.get('rating')
+                    details['review_text'] = rating_data.get('review_text', '')
+                    details['review_date'] = rating_data.get('date', '')
+
+                watched.append(details)
+
+            return watched
+
+        except Exception as e:
+            logger.error(f"Ошибка получения просмотренных фильмов: {e}")
+            return []
 
 
 # Инициализация глобальных объектов
@@ -649,16 +699,22 @@ async def get_recommendations_for_user(user_id: str, context_params: Dict = None
     if not _initialized:
         init_online_components()
 
-    # Проверка кэша
-    cached = cache_manager.get_cached_top_n(user_id)
-    if cached:
-        logger.info(f"Возвращены кэшированные рекомендации для {user_id}")
-        return cached
+    force_refresh = context_params.get('force_refresh', False) if context_params else False
+
+    # Проверка кэша (только если не принудительное обновление)
+    if not force_refresh:
+        cached = cache_manager.get_cached_top_n(user_id)
+        if cached:
+            logger.info(f"Возвращены кэшированные рекомендации для {user_id}")
+            return cached
 
     # Получение контекста
     context = context_handler.get_user_context(user_id, context_params)
     context['user_rated_movies'] = context_handler.get_user_rated_movies(user_id)
     context['user_genre_preferences'] = context_handler.get_user_genre_preferences(user_id)
+
+    logger.info(f"Контекст для {user_id}: оценено фильмов={len(context['user_rated_movies'])}, "
+                f"жанров={len(context['user_genre_preferences'])}")
 
     # Генерация кандидатов
     candidates = await candidate_generator.generate_candidates(context)
@@ -729,18 +785,85 @@ def run_offline_pipeline():
 
 # Инициализация приложения (выполняется при старте)
 def setup_app():
-    """Настройка приложения"""
-    global loop
+    """Настройка приложения с проверкой необходимости переобучения"""
+    global loop, models_provider, data_provider, _initialized, recommender, reviews_df
 
     logger.info("Настройка приложения...")
 
-    # Проверка наличия моделей
-    if not model_trainer.load_models():
-        logger.info("Модели не найдены, запуск офлайн-обучения...")
-        run_offline_pipeline()
-    else:
-        # Модели есть, просто инициализируем онлайн-компоненты
+    # Создаем директорию для моделей
+    os.makedirs(config.offline.models_path, exist_ok=True)
+
+    # Функция для асинхронной проверки и обучения
+    async def check_and_train():
+        global models_provider, data_provider, recommender, reviews_df
+
+        # 1. Загружаем данные для проверки
+        logger.info("Загрузка данных для проверки...")
+        if not await data_pipeline.load_data():
+            logger.error("Не удалось загрузить данные")
+            return False
+
+        data_pipeline.preprocess_data()
+
+        # 2. Создаем снапшот данных
+        data_snapshot = model_trainer.versioning.get_data_snapshot(data_pipeline)
+        logger.info(f"Снапшот данных: {list(data_snapshot.keys())}")
+
+        # 3. Проверяем, нужно ли переобучение
+        need_training = not model_trainer.load_models(data_snapshot)
+
+        if need_training:
+            logger.info("Требуется переобучение моделей")
+
+            # Полный пайплайн
+            data = await data_pipeline.run_pipeline()
+            data_pipeline.save_data(data)
+
+            # Обучение моделей
+            await model_trainer.train_all_models(data)
+
+            # Сохраняем модели со снапшотом данных
+            model_trainer.save_models(data_snapshot)
+
+            logger.info("Модели успешно переобучены")
+        else:
+            logger.info("Модели актуальны, переобучение не требуется")
+            # Просто загружаем данные для онлайн-компонентов
+            data = await data_pipeline.run_pipeline()
+
+        # 4. Обновляем глобальные переменные
+        # Загружаем reviews_df для совместимости
+        reviews_path = f'{model_trainer.models_path}reviews_df.pkl'
+        if os.path.exists(reviews_path):
+            reviews_df = pd.read_pickle(reviews_path)
+            logger.info(f"Загружено {len(reviews_df)} ревью")
+        else:
+            reviews_df = None
+
+        return True
+
+    # Запускаем проверку в отдельном цикле событий
+    init_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(init_loop)
+
+    try:
+        success = init_loop.run_until_complete(check_and_train())
+        if not success:
+            logger.error("Не удалось настроить приложение")
+    except Exception as e:
+        logger.error(f"Ошибка при настройке: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        init_loop.close()
+
+    # Инициализируем провайдеров и онлайн-компоненты
+    if model_trainer.load_models():
+        models_provider = ModelsProvider(model_trainer, data_pipeline)
+        data_provider = DataProvider(data_pipeline)
         init_online_components()
+    else:
+        logger.error("Не удалось загрузить модели")
 
     logger.info("Приложение настроено")
 
@@ -764,7 +887,6 @@ def get_recommendations_api():
 
     top_n = data.get('top_n', 50)
 
-    # Нормализуем URL пользователя
     def normalize_url(url):
         url = str(url).strip()
         url = url.replace('https://www.imdb.com', '')
@@ -774,21 +896,45 @@ def get_recommendations_api():
         return url
 
     normalized_user_id = normalize_url(user_id)
-
     logger.info(f"Получение рекомендаций для пользователя: {normalized_user_id}")
 
     try:
-        # Запускаем асинхронную функцию в синхронном контексте
         if not _initialized:
             init_online_components()
 
-        # Создаем новый цикл для этого запроса, если текущий закрыт
         if loop is None or loop.is_closed():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
+        # Получаем историю пользователя
+        user_rated_movies = data_provider.get_user_watched_movies(normalized_user_id) if data_provider else []
+        logger.info(f"Пользователь {normalized_user_id} оценил {len(user_rated_movies)} фильмов")
+
+        # Получаем жанровые предпочтения
+        genre_prefs = {}
+        if context_handler:
+            genre_prefs = context_handler.get_user_genre_preferences(normalized_user_id)
+            logger.info(f"Жанровые предпочтения: {genre_prefs}")
+
+        # ВАЖНО: Инвалидируем кэш, если у пользователя появились новые оценки
+        # Это заставит систему пересчитать рекомендации
+        if user_rated_movies:
+            # Проверяем, есть ли кэш и нужно ли его инвалидировать
+            cached = cache_manager.get_cached_top_n(normalized_user_id)
+            if cached:
+                # Проверяем, соответствует ли кэш текущим предпочтениям
+                # Для простоты - инвалидируем, если есть жанровые предпочтения
+                if genre_prefs:
+                    cache_manager.invalidate_user_cache(normalized_user_id)
+                    logger.info(f"Кэш инвалидирован для {normalized_user_id} для персонализации")
+
+        # Получаем рекомендации
         recommendations = loop.run_until_complete(
-            get_recommendations_for_user(normalized_user_id, {})
+            get_recommendations_for_user(normalized_user_id, {
+                'user_rated_count': len(user_rated_movies),
+                'genre_preferences': genre_prefs,
+                'force_refresh': True  # Флаг для принудительного обновления
+            })
         )
 
         # Обогащаем рекомендации данными
@@ -813,15 +959,15 @@ def get_recommendations_api():
                                     match = models_provider.genres_df[models_provider.genres_df['title'] == genre_en]
                                     if len(match) > 0:
                                         genre_ru = match.iloc[0]['title_ru']
-                                elif 'genre_ru' in models_provider.genres_df.columns:
-                                    match = models_provider.genres_df[models_provider.genres_df['genre_en'] == genre_en]
-                                    if len(match) > 0:
-                                        genre_ru = match.iloc[0]['genre_ru']
                             genres_ru.append(genre_ru)
                     details['genres'] = genres_ru
+
+                    # Добавляем информацию, почему рекомендован
+                    details['recommendation_reason'] = _get_recommendation_reason(details, genre_prefs)
+
                     enriched.append(details)
 
-        logger.info(f"Возвращено {len(enriched)} рекомендаций для пользователя {normalized_user_id}")
+        logger.info(f"Возвращено {len(enriched)} персонализированных рекомендаций для пользователя {normalized_user_id}")
         return jsonify({'recommendations': enriched})
 
     except Exception as e:
@@ -830,6 +976,25 @@ def get_recommendations_api():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+def _get_recommendation_reason(movie_details: dict, user_genre_prefs: dict) -> str:
+    """Генерирует объяснение для рекомендации"""
+    if not user_genre_prefs:
+        return "Рекомендуем на основе популярности"
+
+    movie_genres = movie_details.get('genres', [])
+    matching_genres = []
+
+    for genre in movie_genres:
+        for user_genre in user_genre_prefs.keys():
+            if user_genre.lower() in genre.lower() or genre.lower() in user_genre.lower():
+                matching_genres.append(genre)
+                break
+
+    if matching_genres:
+        return f"Вам нравятся фильмы жанра {matching_genres[0]}"
+
+    return "Рекомендуем на основе ваших предпочтений"
 
 @app.route('/api/debug/user/<path:user_url>', methods=['GET'])
 def debug_user(user_url):
@@ -933,6 +1098,26 @@ def get_cache_stats():
     return jsonify(stats)
 
 
+@app.route('/api/cache/invalidate/<path:user_url>', methods=['POST'])
+def invalidate_user_cache(user_url):
+    """Инвалидация кэша для пользователя"""
+    user_url = unquote(user_url)
+
+    def normalize_url(url):
+        url = str(url).strip()
+        url = url.replace('https://www.imdb.com', '')
+        url = url.replace('http://www.imdb.com', '')
+        url = url.rstrip('/')
+        url = url.split('?')[0]
+        return url
+
+    normalized_user_id = normalize_url(user_url)
+    cache_manager.invalidate_user_cache(normalized_user_id)
+
+    logger.info(f"Кэш инвалидирован для {normalized_user_id}")
+    return jsonify({'success': True, 'user_id': normalized_user_id})
+
+
 @app.route('/api/feedback/stats', methods=['GET'])
 def get_feedback_stats():
     """Получение статистики обратной связи"""
@@ -956,12 +1141,29 @@ def login_page():
     return render_template('login.html')
 
 
-@app.route('/api/users/list')
+@app.route('/api/users/list', methods=['GET'])
 def get_users_list():
-    """Получить список всех пользователей для входа"""
+    """Получить список всех пользователей для входа (PostgreSQL)"""
     try:
         if data_provider is None or data_provider.user_main_df is None:
-            return jsonify({'error': 'Данные пользователей не загружены'}), 500
+            # Загружаем пользователей напрямую из БД
+            async def get_users():
+                if not data_pipeline.connection:
+                    data_pipeline._create_connection()
+
+                with data_pipeline.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT user_url, username FROM db.users 
+                        ORDER BY username
+                    """)
+                    return cursor.fetchall()
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            users = loop.run_until_complete(get_users())
+            loop.close()
+
+            return jsonify({'users': users})
 
         if len(data_provider.user_main_df) == 0:
             return jsonify({'error': 'Нет данных о пользователях'}), 500
@@ -1061,6 +1263,16 @@ def catalog_page():
                            current_user_url=session.get('user_url'))
 
 
+@app.route('/favorites')
+def favorites_page():
+    """Страница избранных фильмов"""
+    if 'user_url' not in session or not session['user_url']:
+        return redirect(url_for('login_page'))
+    return render_template('favorites.html',
+                           current_user=session.get('username'),
+                           current_user_url=session.get('user_url'))
+
+
 @app.route('/movie/<movie_id>')
 def movie_detail_page(movie_id):
     """Страница деталей фильма"""
@@ -1151,6 +1363,9 @@ def get_user_watched_movies_api(user_url):
             url = str(url).strip()
             url = url.replace('https://www.imdb.com', '')
             url = url.replace('http://www.imdb.com', '')
+            url = re.sub(r'/+', '/', url)
+            if url and not url.startswith('/'):
+                url = f'/{url}'
             url = url.rstrip('/')
             url = url.split('?')[0]
             return url
@@ -1161,81 +1376,102 @@ def get_user_watched_movies_api(user_url):
         if not watched_movies:
             return jsonify({'movies': [], 'total': 0})
 
+        # Обработка NaN значений
+        def clean_value(value, default=''):
+            if value is None:
+                return default
+            if isinstance(value, float):
+                import math
+                if math.isnan(value):
+                    return default
+            if pd.isna(value):
+                return default
+            return value
+
         enriched = []
         for movie in watched_movies:
-            if recommender:
-                details = recommender.get_movie_details(movie['movie_id'])
-                if details:
-                    details['user_rating'] = movie.get('rating')
-                    details['user_review'] = movie.get('review_text')
-                    details['review_date'] = movie.get('date')
-                    details['poster'] = get_poster_filename(details.get('title', ''), details.get('year', ''))
+            details = dict(movie)
 
-                    # Конвертируем жанры в русские названия
-                    genres_ru = []
-                    genre_val = details.get('genre', '')
-                    if genre_val and pd.notna(genre_val):
-                        # Проверяем, что genre_val не массив
-                        if not isinstance(genre_val, (list, np.ndarray)):
-                            genres_en = [g.strip() for g in str(genre_val).split(',') if g.strip()]
-                            for genre_en in genres_en:
-                                genre_ru = genre_en
-                                if models_provider and models_provider.genres_df is not None:
-                                    if 'title_ru' in models_provider.genres_df.columns:
-                                        match = models_provider.genres_df[
-                                            models_provider.genres_df['title'] == genre_en]
-                                        if len(match) > 0:
-                                            genre_ru = match.iloc[0]['title_ru']
-                                    elif 'genre_ru' in models_provider.genres_df.columns:
-                                        match = models_provider.genres_df[
-                                            models_provider.genres_df['genre_en'] == genre_en]
-                                        if len(match) > 0:
-                                            genre_ru = match.iloc[0]['genre_ru']
-                                genres_ru.append(genre_ru)
-                    details['genres'] = genres_ru
+            details['user_rating'] = clean_value(movie.get('rating'), None)
+            details['user_review'] = clean_value(movie.get('review_text'), '')
+            details['review_date'] = clean_value(movie.get('review_date') or movie.get('date'), '')
+            details['poster'] = get_poster_filename(
+                clean_value(details.get('title', '')),
+                clean_value(details.get('year', ''))
+            )
 
-                    # Режиссеры на русском - исправленная проверка
-                    directors_ru = []
-                    directors_val = details.get('directors_ru', '')
+            # Конвертируем жанры в русские названия
+            genres_ru = []
+            genre_val = details.get('genre', '')
+            if genre_val and pd.notna(genre_val) and genre_val != 'nan':
+                if not isinstance(genre_val, (list, np.ndarray)):
+                    genres_en = [g.strip() for g in str(genre_val).split(',') if g.strip()]
+                    for genre_en in genres_en:
+                        genre_ru = genre_en
+                        if models_provider and models_provider.genres_df is not None:
+                            if 'title_ru' in models_provider.genres_df.columns:
+                                match = models_provider.genres_df[
+                                    models_provider.genres_df['title'] == genre_en]
+                                if len(match) > 0:
+                                    genre_ru = match.iloc[0]['title_ru']
+                            elif 'genre_ru' in models_provider.genres_df.columns:
+                                match = models_provider.genres_df[
+                                    models_provider.genres_df['genre_en'] == genre_en]
+                                if len(match) > 0:
+                                    genre_ru = match.iloc[0]['genre_ru']
+                        genres_ru.append(genre_ru)
+            details['genres'] = genres_ru if genres_ru else details.get('genres', [])
 
-                    # Проверяем, пустое ли значение и не массив ли это
-                    if directors_val is None or (
-                            isinstance(directors_val, str) and (not directors_val or directors_val == 'nan')):
-                        directors_val = details.get('directors', '')
+            # Режиссеры на русском
+            directors_ru = []
+            directors_val = details.get('directors_ru', '')
+            if directors_val is None or (
+                    isinstance(directors_val, str) and (not directors_val or directors_val == 'nan')):
+                directors_val = details.get('directors', '')
+            if isinstance(directors_val, str) and directors_val and directors_val != 'nan':
+                directors_ru = [d.strip() for d in str(directors_val).split(',') if d.strip()]
+            elif isinstance(directors_val, (list, tuple, np.ndarray)):
+                directors_ru = [str(d).strip() for d in directors_val if d and str(d) != 'nan']
+            details['directors_ru'] = directors_ru
+            details['directors'] = directors_ru
 
-                    # Обрабатываем значение только если это строка
-                    if isinstance(directors_val, str) and directors_val and directors_val != 'nan':
-                        directors_ru = [d.strip() for d in str(directors_val).split(',') if d.strip()]
-                    elif isinstance(directors_val, (list, tuple, np.ndarray)):
-                        # Если это уже массив, используем его
-                        directors_ru = [str(d).strip() for d in directors_val if d and str(d) != 'nan']
+            # Актеры на русском
+            actors_ru = []
+            actors_val = details.get('actors_ru', '')
+            if actors_val is None or (isinstance(actors_val, str) and (not actors_val or actors_val == 'nan')):
+                actors_val = details.get('actors', '')
+            if isinstance(actors_val, str) and actors_val and actors_val != 'nan':
+                actors_ru = [a.strip() for a in str(actors_val).split(',') if a.strip()]
+            elif isinstance(actors_val, (list, tuple, np.ndarray)):
+                actors_ru = [str(a).strip() for a in actors_val if a and str(a) != 'nan']
+            details['actors_ru'] = actors_ru
+            details['actors'] = actors_ru
 
-                    details['directors_ru'] = directors_ru
-                    details['directors'] = directors_ru  # Перезаписываем массивом русских имен
+            # Очищаем числовые значения
+            if 'imdb_rating' in details:
+                imdb_val = details['imdb_rating']
+                if imdb_val is None or (isinstance(imdb_val, float) and math.isnan(imdb_val)):
+                    details['imdb_rating'] = None
 
-                    # Актеры на русском - исправленная проверка
-                    actors_ru = []
-                    actors_val = details.get('actors_ru', '')
+            # Очищаем год
+            if 'year' in details:
+                year_val = details['year']
+                if year_val is None or (isinstance(year_val, float) and math.isnan(year_val)):
+                    details['year'] = ''
+                else:
+                    details['year'] = str(year_val)
 
-                    # Проверяем, пустое ли значение и не массив ли это
-                    if actors_val is None or (isinstance(actors_val, str) and (not actors_val or actors_val == 'nan')):
-                        actors_val = details.get('actors', '')
-
-                    # Обрабатываем значение только если это строка
-                    if isinstance(actors_val, str) and actors_val and actors_val != 'nan':
-                        actors_ru = [a.strip() for a in str(actors_val).split(',') if a.strip()]
-                    elif isinstance(actors_val, (list, tuple, np.ndarray)):
-                        # Если это уже массив, используем его
-                        actors_ru = [str(a).strip() for a in actors_val if a and str(a) != 'nan']
-
-                    details['actors_ru'] = actors_ru
-                    details['actors'] = actors_ru  # Перезаписываем массивом русских имен
-
-                    enriched.append(details)
+            enriched.append(details)
 
         enriched.sort(key=lambda x: x.get('review_date', ''), reverse=True)
-        logger.info(f"Успешно загружено просмотренных фильмов: {len(enriched)}")
-        return jsonify({'movies': enriched, 'total': len(enriched)})
+
+        # Используем jsonify с обработкой NaN
+        response_data = {'movies': enriched, 'total': len(enriched)}
+        return app.response_class(
+            response=json.dumps(response_data, default=handle_nan),
+            status=200,
+            mimetype='application/json'
+        )
 
     except Exception as e:
         logger.error(f"Ошибка при получении просмотренных фильмов: {e}")
@@ -1251,62 +1487,83 @@ def get_user_watched_stats_api(user_url):
         return jsonify({'error': 'Система не инициализирована'}), 500
 
     try:
-        # Декодируем URL пользователя
         user_url = unquote(user_url)
         logger.info(f"Получение статистики для пользователя: {user_url}")
 
-        # Нормализуем URL
         def normalize_url(url):
             url = str(url).strip()
             url = url.replace('https://www.imdb.com', '')
             url = url.replace('http://www.imdb.com', '')
+            url = re.sub(r'/+', '/', url)
+            if url and not url.startswith('/'):
+                url = f'/{url}'
             url = url.rstrip('/')
             url = url.split('?')[0]
             return url
 
         normalized_user_url = normalize_url(user_url)
-
-        # Получаем просмотренные фильмы
         watched_movies = data_provider.get_user_watched_movies(normalized_user_url)
 
         if not watched_movies:
-            return jsonify({
+            result = {
                 'total_watched': 0,
                 'avg_rating': 0,
                 'genre_distribution': [],
                 'year_distribution': [],
                 'rating_distribution': []
-            })
+            }
+            return app.response_class(
+                response=json.dumps(result, default=handle_nan),
+                status=200,
+                mimetype='application/json'
+            )
 
-        # Общая статистика
         total_watched = len(watched_movies)
 
-        # Вычисляем среднюю оценку (игнорируем None)
-        ratings = [m.get('rating') for m in watched_movies if m.get('rating') is not None]
+        def parse_rating(value):
+            if value is None:
+                return None
+            if isinstance(value, float) and math.isnan(value):
+                return None
+            if pd.isna(value):
+                return None
+            try:
+                if isinstance(value, str):
+                    normalized = value.strip().replace(',', '.')
+                    if '/' in normalized:
+                        normalized = normalized.split('/')[0].strip()
+                    value = normalized
+                return float(value)
+            except Exception:
+                return None
+
+        # Фильтруем оценки, убирая None и NaN
+        ratings = []
+        for m in watched_movies:
+            rating = parse_rating(m.get('rating', m.get('user_rating')))
+            if rating is not None:
+                ratings.append(rating)
+
         avg_rating = round(sum(ratings) / len(ratings), 2) if ratings else 0
 
-        # Распределение по жанрам (с русскими названиями)
+        # Распределение по жанрам
         genre_counts = {}
         for movie in watched_movies:
-            movie_id = movie.get('movie_id')
-            if movie_id and recommender:
-                details = recommender.get_movie_details(movie_id)
-                if details and details.get('genre'):
-                    # Получаем английские названия жанров
-                    genres_en = [g.strip() for g in str(details['genre']).split(',') if g.strip()]
-                    for genre_en in genres_en:
-                        # Конвертируем в русское название
-                        genre_ru = genre_en
-                        if models_provider and models_provider.genres_df is not None:
-                            if 'title_ru' in models_provider.genres_df.columns:
-                                match = models_provider.genres_df[models_provider.genres_df['title'] == genre_en]
-                                if len(match) > 0:
-                                    genre_ru = match.iloc[0]['title_ru']
-                            elif 'genre_ru' in models_provider.genres_df.columns:
-                                match = models_provider.genres_df[models_provider.genres_df['genre_en'] == genre_en]
-                                if len(match) > 0:
-                                    genre_ru = match.iloc[0]['genre_ru']
-                        genre_counts[genre_ru] = genre_counts.get(genre_ru, 0) + 1
+            genre_val = movie.get('genre', '')
+            if genre_val and pd.notna(genre_val) and genre_val != 'nan':
+                genres_en = [g.strip() for g in str(genre_val).split(',') if g.strip()]
+                for genre_en in genres_en:
+                    genre_ru = genre_en
+                    if models_provider and models_provider.genres_df is not None:
+                        if 'title_ru' in models_provider.genres_df.columns:
+                            match = models_provider.genres_df[models_provider.genres_df['title'] == genre_en]
+                            if len(match) > 0:
+                                genre_ru = match.iloc[0]['title_ru']
+                        elif 'genre_ru' in models_provider.genres_df.columns:
+                            match = models_provider.genres_df[models_provider.genres_df['genre_en'] == genre_en]
+                            if len(match) > 0:
+                                genre_ru = match.iloc[0]['genre_ru']
+                    genre_counts[genre_ru] = genre_counts.get(genre_ru, 0) + 1
 
         genre_distribution = [{'genre': k, 'count': v} for k, v in
                               sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:10]]
@@ -1314,24 +1571,25 @@ def get_user_watched_stats_api(user_url):
         # Распределение по годам
         year_counts = {}
         for movie in watched_movies:
-            movie_id = movie.get('movie_id')
-            if movie_id and recommender:
-                details = recommender.get_movie_details(movie_id)
-                if details and details.get('year'):
-                    year = str(details['year'])
-                    if year and year != 'nan' and year != 'None':
-                        try:
-                            year_int = int(float(year))
-                            year_counts[year_int] = year_counts.get(year_int, 0) + 1
-                        except:
-                            pass
+            year_val = movie.get('year')
+            if year_val and pd.notna(year_val) and year_val != 'nan':
+                try:
+                    year_int = int(float(year_val))
+                    if 1900 <= year_int <= 2030:
+                        year_counts[year_int] = year_counts.get(year_int, 0) + 1
+                except Exception:
+                    pass
 
         year_distribution = [{'year': str(k), 'count': v} for k, v in sorted(year_counts.items())]
 
         # Распределение оценок
         rating_distribution = []
         for i in range(1, 11):
-            count = sum(1 for m in watched_movies if m.get('rating') == i)
+            count = 0
+            for m in watched_movies:
+                rating = parse_rating(m.get('rating', m.get('user_rating')))
+                if rating is not None and int(rating) == i:
+                    count += 1
             rating_distribution.append({'rating': i, 'count': count})
 
         result = {
@@ -1342,7 +1600,11 @@ def get_user_watched_stats_api(user_url):
             'rating_distribution': rating_distribution
         }
 
-        return jsonify(result)
+        return app.response_class(
+            response=json.dumps(result, default=handle_nan),
+            status=200,
+            mimetype='application/json'
+        )
 
     except Exception as e:
         logger.error(f"Ошибка при получении статистики: {e}")
@@ -1479,6 +1741,79 @@ def get_movie_details_api(movie_id):
 
     except Exception as e:
         logger.error(f"Ошибка при получении фильма {movie_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/movies/<movie_id>/similar', methods=['GET'])
+@app.route('/api/movie/<movie_id>/similar', methods=['GET'])
+def get_similar_movies_api(movie_id):
+    """API для получения похожих фильмов."""
+    if recommender is None:
+        return jsonify({'error': 'Система не инициализирована'}), 500
+
+    try:
+        similar_source = models_provider if models_provider is not None else recommender
+        if similar_source is None:
+            return jsonify({'movies': []})
+
+        raw_similar = similar_source.get_similar_movies(movie_id, n=20)
+        if not raw_similar and models_provider is not None and models_provider.movies_df is not None:
+            # Fallback: если model-based similar недоступен, берем похожие по жанру/году из каталога.
+            current_movie = models_provider.movies_df[models_provider.movies_df['movie_id'] == movie_id]
+            if len(current_movie) > 0:
+                current = current_movie.iloc[0]
+                genre_value = str(current.get('genre', '') or '')
+                year_value = current.get('year')
+
+                candidates = models_provider.movies_df[models_provider.movies_df['movie_id'] != movie_id].copy()
+                if genre_value:
+                    candidates = candidates[
+                        candidates['genre'].astype(str).str.contains(genre_value.split(',')[0].strip(), case=False, na=False)
+                    ]
+                if year_value is not None and pd.notna(year_value):
+                    try:
+                        year_num = int(float(year_value))
+                        candidates = candidates[
+                            pd.to_numeric(candidates['year'], errors='coerce').between(year_num - 3, year_num + 3, inclusive='both')
+                        ]
+                    except Exception:
+                        pass
+
+                raw_similar = []
+                for _, row in candidates.head(20).iterrows():
+                    raw_similar.append({
+                        'movie_id': str(row.get('movie_id', '')),
+                        'title': str(row.get('title', '')),
+                        'year': row.get('year'),
+                        'similarity': 0.75
+                    })
+
+        if not raw_similar:
+            return jsonify({'movies': []})
+
+        movies = []
+        for item in raw_similar:
+            similar_id = str(item.get('movie_id', '')).strip()
+            if not similar_id:
+                continue
+
+            details = recommender.get_movie_details(similar_id) or {}
+            title = details.get('title') or item.get('title') or ''
+            year = details.get('year') if details.get('year') is not None else item.get('year')
+
+            movies.append({
+                'movie_id': similar_id,
+                'title': title,
+                'title_ru': details.get('title_ru', title),
+                'year': str(year) if year not in (None, '', 'nan') else '',
+                'poster': get_poster_filename(title, year),
+                'similarity': float(item.get('similarity', 0))
+            })
+
+        return jsonify({'movies': movies})
+
+    except Exception as e:
+        logger.error(f"Ошибка получения похожих фильмов для {movie_id}: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -1817,6 +2152,399 @@ def get_genre_description(genre_name):
         logger.error(f"Ошибка получения описания жанра: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+# ==================== ПОЛЬЗОВАТЕЛИ (POSTGRESQL) ====================
+
+
+@app.route('/api/user/create', methods=['POST'])
+def create_user():
+    """Создание нового пользователя в PostgreSQL"""
+    try:
+        data = request.json
+        username = data.get('username', '').strip()
+
+        if not username:
+            return jsonify({'error': 'Имя пользователя обязательно'}), 400
+
+        # Создаем пользователя через data_pipeline
+        async def create():
+            return await data_pipeline.create_user(username)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        new_user = loop.run_until_complete(create())
+        loop.close()
+
+        if new_user:
+            # Обновляем data_provider
+            if data_provider and hasattr(data_provider, 'user_main_df'):
+                new_df = pd.DataFrame([new_user])
+                data_provider.user_main_df = pd.concat([data_provider.user_main_df, new_df], ignore_index=True)
+
+            return jsonify({
+                'success': True,
+                'user_url': new_user['user_url'],
+                'username': new_user['username'],
+                'message': 'Пользователь успешно создан'
+            })
+        else:
+            return jsonify({'error': 'Не удалось создать пользователя'}), 500
+
+    except Exception as e:
+        logger.error(f"Ошибка создания пользователя: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/movie/<movie_id>/rate', methods=['POST'])
+def rate_movie(movie_id):
+    """Оценка фильма пользователем (PostgreSQL)"""
+    try:
+        data = request.json
+        user_id = data.get('user_id') or session.get('user_url')
+        rating = data.get('rating')
+        review_text = data.get('review_text', '').strip()
+
+        if not user_id:
+            return jsonify({'error': 'Пользователь не авторизован'}), 401
+
+        if rating is None:
+            return jsonify({'error': 'Оценка обязательна'}), 400
+
+        try:
+            rating = float(rating)
+            if rating < 1 or rating > 10:
+                return jsonify({'error': 'Оценка должна быть от 1 до 10'}), 400
+        except ValueError:
+            return jsonify({'error': 'Неверный формат оценки'}), 400
+
+        # Нормализуем user_id
+        def normalize_url(url):
+            url = str(url).strip()
+            url = url.replace('https://www.imdb.com', '')
+            url = url.replace('http://www.imdb.com', '')
+            url = re.sub(r'/+', '/', url)
+            if url and not url.startswith('/'):
+                url = f'/{url}'
+            url = url.rstrip('/')
+            url = url.split('?')[0]
+            return url
+
+        normalized_user_id = normalize_url(user_id)
+
+        # Сохраняем оценку через data_pipeline
+        async def save_rating():
+            return await data_pipeline.save_user_rating(
+                normalized_user_id, movie_id, rating, review_text
+            )
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success = loop.run_until_complete(save_rating())
+        loop.close()
+
+        if success:
+            # Инвалидируем кэш пользователя
+            cache_manager.invalidate_user_cache(normalized_user_id)
+
+            # Логируем обратную связь
+            if feedback_logger:
+                try:
+                    feedback_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(feedback_loop)
+                    feedback_loop.run_until_complete(
+                        feedback_logger.log_rating(normalized_user_id, movie_id, rating)
+                    )
+                    feedback_loop.close()
+                except Exception as feedback_error:
+                    logger.warning(f"Не удалось записать feedback log: {feedback_error}")
+
+            logger.info(f"Пользователь {normalized_user_id} оценил фильм {movie_id} на {rating}")
+
+            return jsonify({
+                'success': True,
+                'message': 'Оценка сохранена'
+            })
+        else:
+            return jsonify({'error': 'Не удалось сохранить оценку'}), 500
+
+    except Exception as e:
+        logger.error(f"Ошибка сохранения оценки: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/movie/<movie_id>/watched', methods=['POST'])
+def add_to_watched(movie_id):
+    """Добавление фильма в просмотренное (PostgreSQL)"""
+    try:
+        data = request.json
+        user_id = data.get('user_id') or session.get('user_url')
+
+        if not user_id:
+            return jsonify({'error': 'Пользователь не авторизован'}), 401
+
+        def normalize_url(url):
+            url = str(url).strip()
+            url = url.replace('https://www.imdb.com', '')
+            url = url.replace('http://www.imdb.com', '')
+            url = url.rstrip('/')
+            url = url.split('?')[0]
+            return url
+
+        normalized_user_id = normalize_url(user_id)
+
+        async def add_watched():
+            return await data_pipeline.add_to_watched(normalized_user_id, movie_id)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success = loop.run_until_complete(add_watched())
+        loop.close()
+
+        if success:
+            logger.info(f"Фильм {movie_id} добавлен в просмотренные пользователем {normalized_user_id}")
+            return jsonify({'success': True, 'message': 'Фильм добавлен в просмотренные'})
+        else:
+            return jsonify({'error': 'Не удалось добавить фильм'}), 500
+
+    except Exception as e:
+        logger.error(f"Ошибка добавления в просмотренное: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/movie/<movie_id>/favorite', methods=['POST', 'DELETE'])
+def toggle_favorite(movie_id):
+    """Добавление/удаление фильма в избранное (PostgreSQL)"""
+    try:
+        data = request.json
+        user_id = data.get('user_id') or session.get('user_url')
+
+        if not user_id:
+            return jsonify({'error': 'Пользователь не авторизован'}), 401
+
+        def normalize_url(url):
+            url = str(url).strip()
+            url = url.replace('https://www.imdb.com', '')
+            url = url.replace('http://www.imdb.com', '')
+            url = url.rstrip('/')
+            url = url.split('?')[0]
+            return url
+
+        normalized_user_id = normalize_url(user_id)
+
+        async def toggle():
+            if request.method == 'POST':
+                return await data_pipeline.add_to_favorites(normalized_user_id, movie_id)
+            else:
+                return await data_pipeline.remove_from_favorites(normalized_user_id, movie_id)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success = loop.run_until_complete(toggle())
+        loop.close()
+
+        if success:
+            action = "добавлен в" if request.method == 'POST' else "удален из"
+            logger.info(f"Фильм {movie_id} {action} избранного пользователем {normalized_user_id}")
+
+            return jsonify({
+                'success': True,
+                'message': f'Фильм {action} избранного'
+            })
+        else:
+            return jsonify({'error': 'Не удалось выполнить действие'}), 500
+
+    except Exception as e:
+        logger.error(f"Ошибка работы с избранным: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/<path:user_url>/favorites', methods=['GET'])
+def get_user_favorites(user_url):
+    """Получение списка избранных фильмов пользователя (PostgreSQL)"""
+    try:
+        user_url = unquote(user_url)
+
+        def normalize_url(url):
+            url = str(url).strip()
+            url = url.replace('https://www.imdb.com', '')
+            url = url.replace('http://www.imdb.com', '')
+            url = url.rstrip('/')
+            url = url.split('?')[0]
+            return url
+
+        normalized_user_id = normalize_url(user_url)
+
+        async def get_favorites():
+            return await data_pipeline.get_user_favorites(normalized_user_id)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        favorite_movie_ids = loop.run_until_complete(get_favorites())
+        loop.close()
+
+        # Обогащаем данными о фильмах
+        enriched = []
+        for movie_id in favorite_movie_ids:
+            if recommender:
+                details = recommender.get_movie_details(movie_id)
+                if details:
+                    details['poster'] = get_poster_filename(details.get('title', ''), details.get('year', ''))
+                    enriched.append(details)
+
+        return jsonify({'movies': enriched, 'total': len(enriched)})
+
+    except Exception as e:
+        logger.error(f"Ошибка получения избранного: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _update_user_rating_stats(user_id):
+    """Обновление статистики пользователя после оценки"""
+    try:
+        reviews_file = 'data/reviews.csv'
+        if not os.path.exists(reviews_file):
+            return
+
+        import csv
+        user_ratings = []
+
+        with open(reviews_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('user_url') == user_id:
+                    rating = row.get('rating')
+                    if rating:
+                        try:
+                            user_ratings.append(float(rating))
+                        except:
+                            pass
+
+        # Обновляем users.csv
+        users_file = 'data/users.csv'
+        if os.path.exists(users_file):
+            rows = []
+            with open(users_file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                for row in reader:
+                    if row.get('user_url') == user_id:
+                        row['ratings_count'] = len(user_ratings)
+                    rows.append(row)
+
+            with open(users_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+    except Exception as e:
+        logger.error(f"Ошибка обновления статистики: {e}")
+
+
+@app.route('/api/movie/<movie_id>/user-rating', methods=['GET'])
+def get_user_movie_rating(movie_id):
+    """Получение оценки пользователя для фильма (PostgreSQL)"""
+    try:
+        user_id = session.get('user_url')
+        if not user_id:
+            return jsonify({'rating': None})
+
+        def normalize_url(url):
+            url = str(url).strip()
+            url = url.replace('https://www.imdb.com', '')
+            url = url.replace('http://www.imdb.com', '')
+            url = url.rstrip('/')
+            url = url.split('?')[0]
+            return url
+
+        normalized_user_id = normalize_url(user_id)
+
+        async def get_rating():
+            return await data_pipeline.get_user_rating(normalized_user_id, movie_id)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        rating_data = loop.run_until_complete(get_rating())
+        loop.close()
+
+        if rating_data:
+            return jsonify({
+                'rating': rating_data.get('rating'),
+                'review_text': rating_data.get('review_text', '')
+            })
+
+        return jsonify({'rating': None, 'review_text': None})
+
+    except Exception as e:
+        logger.error(f"Ошибка получения оценки: {e}")
+        return jsonify({'rating': None})
+
+
+@app.route('/api/movie/<movie_id>/check-watched', methods=['GET'])
+def check_movie_watched(movie_id):
+    """Проверка, добавлен ли фильм в просмотренные (PostgreSQL)"""
+    try:
+        user_id = session.get('user_url')
+        if not user_id:
+            return jsonify({'watched': False})
+
+        def normalize_url(url):
+            url = str(url).strip()
+            url = url.replace('https://www.imdb.com', '')
+            url = url.replace('http://www.imdb.com', '')
+            url = url.rstrip('/')
+            url = url.split('?')[0]
+            return url
+
+        normalized_user_id = normalize_url(user_id)
+
+        async def check_watched():
+            return await data_pipeline.check_movie_watched(normalized_user_id, movie_id)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        is_watched = loop.run_until_complete(check_watched())
+        loop.close()
+
+        return jsonify({'watched': is_watched})
+
+    except Exception as e:
+        logger.error(f"Ошибка проверки просмотра: {e}")
+        return jsonify({'watched': False})
+
+
+@app.route('/api/movie/<movie_id>/check-favorite', methods=['GET'])
+def check_movie_favorite(movie_id):
+    """Проверка, добавлен ли фильм в избранное (PostgreSQL)"""
+    try:
+        user_id = session.get('user_url')
+        if not user_id:
+            return jsonify({'favorite': False})
+
+        def normalize_url(url):
+            url = str(url).strip()
+            url = url.replace('https://www.imdb.com', '')
+            url = url.replace('http://www.imdb.com', '')
+            url = url.rstrip('/')
+            url = url.split('?')[0]
+            return url
+
+        normalized_user_id = normalize_url(user_id)
+
+        async def check_favorite():
+            return await data_pipeline.check_movie_favorite(normalized_user_id, movie_id)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        is_favorite = loop.run_until_complete(check_favorite())
+        loop.close()
+
+        return jsonify({'favorite': is_favorite})
+
+    except Exception as e:
+        logger.error(f"Ошибка проверки избранного: {e}")
+        return jsonify({'favorite': False})
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

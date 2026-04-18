@@ -6,7 +6,7 @@
     <title>Вход - Movie Recommender System</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/login.css') }}">
 </head>
 <body>
     <div class="login-container">
@@ -18,13 +18,30 @@
             </div>
 
             <form id="login-form">
-                <div class="mb-3">
+                <div class="login-mode-toggle">
+                    <button type="button" class="mode-btn active" id="select-mode-btn">
+                        <i class="fas fa-list"></i> Выбрать из списка
+                    </button>
+                    <button type="button" class="mode-btn" id="input-mode-btn">
+                        <i class="fas fa-keyboard"></i> Ввести имя
+                    </button>
+                </div>
+
+                <div id="select-mode" class="user-select-group">
                     <label for="user-select" class="form-label">
                         <i class="fas fa-user"></i> Выберите пользователя
                     </label>
-                    <select id="user-select" class="form-select" required>
+                    <select id="user-select" class="form-select">
                         <option value="">Загрузка пользователей...</option>
                     </select>
+                </div>
+
+                <div id="input-mode" class="username-input-group">
+                    <label for="username-input" class="form-label">
+                        <i class="fas fa-user"></i> Введите пользователя
+                    </label>
+                    <input type="text" id="username-input" class="form-control"
+                           placeholder="Введите ваше имя пользователя" autocomplete="off">
                 </div>
 
                 <button type="submit" class="btn-login" id="login-btn">
@@ -37,7 +54,48 @@
                 </div>
             </form>
 
-            <div id="error-message" style="display: none;" class="alert alert-danger">
+            <div class="text-center mt-3">
+                <hr>
+                <p class="text-muted">Нет аккаунта?</p>
+                <button type="button" class="btn btn-outline-success" id="openModalBtn">
+                    <i class="fas fa-user-plus"></i> Создать нового пользователя
+                </button>
+            </div>
+
+            <div class="modal fade" id="createUserModal" tabindex="-1" aria-hidden="true">
+                <div class="modal-dialog modal-dialog-centered">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">
+                                <i class="fas fa-user-plus"></i> Создание нового пользователя
+                            </h5>
+                            <button type="button" class="btn-close" id="closeModalBtn" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="mb-3">
+                                <label for="new-username" class="form-label">
+                                    <i class="fas fa-user"></i> Имя пользователя
+                                </label>
+                                <input type="text" class="form-control" id="new-username"
+                                       placeholder="Введите ваше имя" autocomplete="off">
+                                <div class="form-text">Будет отображено в системе</div>
+                            </div>
+                            <div id="create-user-error" class="alert alert-danger" style="display: none;"></div>
+                            <div id="create-user-success" class="alert alert-success" style="display: none;"></div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" id="cancelModalBtn">
+                                <i class="fas fa-times"></i> Отмена
+                            </button>
+                            <button type="button" class="btn btn-success" id="create-user-btn">
+                                <i class="fas fa-check"></i> Создать
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="error-message" style="display: none;" class="alert alert-danger mt-3">
                 <i class="fas fa-exclamation-triangle"></i> <span id="error-text"></span>
             </div>
         </div>

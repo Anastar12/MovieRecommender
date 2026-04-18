@@ -14,24 +14,28 @@ class Ranker:
         self.data = data_provider
         self.config = config or {}
 
-        # Параметры ранжирования
-        self.diversity_weight = self.config.get('diversity_weight', 0.15)
-        self.recency_weight = self.config.get('recency_weight', 0.10)
-        self.popularity_weight = self.config.get('popularity_weight', 0.10)
-        self.personalization_weight = self.config.get('personalization_weight', 0.65)
+        # Параметры ранжирования - усилен вес персонализации
+        self.diversity_weight = self.config.get('diversity_weight', 0.10)
+        self.recency_weight = self.config.get('recency_weight', 0.05)
+        self.popularity_weight = self.config.get('popularity_weight', 0.05)
+        self.personalization_weight = self.config.get('personalization_weight', 0.80)  # Увеличен
 
         self.final_top_n = self.config.get('final_top_n', 50)
 
     async def rank_candidates(self, candidates: List[Dict], context: Dict) -> List[Dict]:
-        """Ранжирование кандидатов"""
+        """Ранжирование кандидатов с учетом профиля пользователя"""
         if not candidates:
             return []
 
-        logger.info(f"Ранжирование {len(candidates)} кандидатов")
+        logger.info(f"Ранжирование {len(candidates)} кандидатов для пользователя {context.get('user_id')}")
+
+        # Получаем профиль пользователя для персонализации
+        user_genres = context.get('user_genre_preferences', {})
+        user_ratings = context.get('user_rated_movies', set())
 
         # Параллельное вычисление оценок
         for candidate in candidates:
-            scores = await self._compute_scores(candidate, context)
+            scores = await self._compute_scores(candidate, context, user_genres, user_ratings)
             candidate['final_score'] = self._aggregate_scores(scores, candidate, context)
 
         # Сортировка по финальному score
@@ -42,16 +46,13 @@ class Ranker:
 
         return diversified[:self.final_top_n]
 
-    async def _compute_scores(self, candidate: Dict, context: Dict) -> Dict:
-        """Вычисление различных компонент оценки"""
+    async def _compute_scores(self, candidate: Dict, context: Dict,
+                              user_genres: Dict, user_ratings: set) -> Dict:
+        """Вычисление различных компонент оценки с учетом пользователя"""
         scores = {}
 
-        # Предсказанная полезность (есть модель)
-        # Исправлено: проверяем через model_trainer
-        if hasattr(self.models, 'trainer') and self.models.trainer.rating_predictor is not None:
-            scores['utility'] = await self._predict_rating(candidate, context)
-        else:
-            scores['utility'] = candidate.get('score', 0.5)
+        # Персонализированная полезность - главный фактор
+        scores['utility'] = await self._compute_personalized_utility(candidate, context, user_genres, user_ratings)
 
         # Разнообразие
         scores['diversity'] = await self._compute_diversity(candidate, context)
@@ -59,7 +60,7 @@ class Ranker:
         # Свежесть
         scores['recency'] = self._compute_recency(candidate)
 
-        # Популярность
+        # Популярность (пониженный вес)
         scores['popularity'] = self._compute_popularity(candidate)
 
         # Контекстная релевантность
@@ -67,54 +68,38 @@ class Ranker:
 
         return scores
 
-    async def _predict_rating(self, candidate: Dict, context: Dict) -> float:
-        """Предсказание оценки пользователя"""
+    async def _compute_personalized_utility(self, candidate: Dict, context: Dict,
+                                            user_genres: Dict, user_ratings: set) -> float:
+        """Вычисление персонализированной полезности на основе истории пользователя"""
+        utility = candidate.get('score', 0.5)
+
+        # 1. Учет жанровых предпочтений
+        movie_genres = candidate.get('genres', [])
+        if movie_genres and user_genres:
+            genre_match_score = 0
+            total_weight = 0
+
+            for genre in movie_genres:
+                # Ищем соответствие с предпочтениями пользователя
+                for user_genre, weight in user_genres.items():
+                    if user_genre.lower() in genre.lower() or genre.lower() in user_genre.lower():
+                        genre_match_score += weight
+                        total_weight += 1
+
+            if total_weight > 0:
+                genre_score = genre_match_score / total_weight
+                utility = utility * 0.5 + genre_score * 0.5
+
+        # 2. Учет похожих фильмов (если есть модель)
         try:
-            user_id = context['user_id']
-            movie_id = candidate['movie_id']
-
-            # Использование модели предсказания через model_trainer
-            if hasattr(self.models, 'trainer') and self.models.trainer.rating_predictor is not None:
-                # Здесь нужно получить индексы пользователя и фильма
-                if hasattr(self.models.data, 'user_indices') and user_id in self.models.data.user_indices:
-                    user_idx = self.models.data.user_indices[user_id]
-                    if movie_id in self.models.data.movie_indices:
-                        movie_idx = self.models.data.movie_indices[movie_id]
-
-                        # Формируем признаки для предсказания
-                        try:
-                            user_svd = self.models.trainer.user_factors[user_idx][:20] if len(
-                                self.models.trainer.user_factors[user_idx]) >= 20 else self.models.trainer.user_factors[
-                                user_idx]
-                            item_svd = self.models.trainer.item_factors[movie_idx][:20] if len(
-                                self.models.trainer.item_factors[movie_idx]) >= 20 else \
-                            self.models.trainer.item_factors[movie_idx]
-                            svd_features = np.concatenate([user_svd, item_svd])
-
-                            extra_features = []
-                            if hasattr(self.models.data, 'popularity_scores') and movie_idx < len(
-                                    self.models.data.popularity_scores):
-                                extra_features.append(float(self.models.data.popularity_scores[movie_idx]))
-                            if hasattr(self.models.data, 'recency_scores') and movie_idx < len(
-                                    self.models.data.recency_scores):
-                                extra_features.append(float(self.models.data.recency_scores[movie_idx]))
-
-                            if extra_features:
-                                features = np.concatenate([svd_features, np.array(extra_features)])
-                            else:
-                                features = svd_features
-
-                            features = features.reshape(1, -1)
-                            rating = self.models.trainer.rating_predictor.predict(features)[0]
-                            return max(0, min(1, rating))
-                        except Exception as e:
-                            logger.error(f"Ошибка предсказания: {e}")
-                            return candidate.get('score', 0.5)
-
-            return candidate.get('score', 0.5)
+            if hasattr(self.models, 'predict_rating'):
+                pred_rating = self.models.predict_rating(context['user_id'], candidate['movie_id'])
+                if pred_rating:
+                    utility = utility * 0.6 + pred_rating * 0.4
         except Exception as e:
-            logger.error(f"Ошибка предсказания: {e}")
-            return 0.5
+            pass
+
+        return max(0, min(1, utility))
 
     async def _compute_diversity(self, candidate: Dict, context: Dict) -> float:
         """Вычисление разнообразия относительно уже выбранных"""
@@ -123,14 +108,12 @@ class Ranker:
             return 1.0
 
         try:
-            # Вычисление средней схожести с выбранными
             similarities = []
             for selected_id in selected:
                 sim = self._get_movie_similarity(candidate['movie_id'], selected_id)
                 similarities.append(sim)
 
             avg_similarity = np.mean(similarities) if similarities else 0
-            # Чем меньше схожесть, тем выше diversity score
             return 1 - avg_similarity
         except Exception as e:
             logger.error(f"Ошибка diversity: {e}")
@@ -147,7 +130,6 @@ class Ranker:
             try:
                 year_int = int(str(year)[:4])
                 age = current_year - year_int
-                # Экспоненциальное затухание
                 recency = np.exp(-age / 20)
                 return max(0, min(1, recency))
             except:
@@ -163,14 +145,11 @@ class Ranker:
         """Вычисление контекстной релевантности"""
         relevance = 0.5
 
-        # Временной контекст
         time_context = context.get('time_context', {})
         if time_context.get('is_weekend', False):
-            # В выходные больше развлекательных фильмов
             genre_relevance = self._check_genre_match(candidate, ['Comedy', 'Action', 'Adventure'])
             relevance = max(relevance, genre_relevance * 0.3)
 
-        # Сезонный контекст
         season = time_context.get('season', '')
         if season == 'winter':
             genre_relevance = self._check_genre_match(candidate, ['Drama', 'Romance', 'Family'])
@@ -200,7 +179,6 @@ class Ranker:
                 scores.get('contextual', 0) * 0.05
         )
 
-        # Нормализация
         total_weight = (self.personalization_weight + self.diversity_weight +
                         self.recency_weight + self.popularity_weight + 0.05)
 
@@ -215,16 +193,13 @@ class Ranker:
         genre_last_seen = {}
 
         for candidate in candidates:
-            # Получение основного жанра
             genres = candidate.get('genres', [])
             main_genre = genres[0] if genres else 'unknown'
 
-            # Проверка, не было ли слишком много фильмов этого жанра подряд
             if main_genre in genre_last_seen:
                 last_pos = genre_last_seen[main_genre]
                 distance = len(diversified) - last_pos
                 if distance < 2 and len(diversified) > 0:
-                    # Пропускаем этот фильм, берем следующий
                     continue
 
             genre_last_seen[main_genre] = len(diversified)
@@ -233,7 +208,6 @@ class Ranker:
             if len(diversified) >= self.final_top_n:
                 break
 
-        # Если после чередования осталось мало фильмов, добавляем остальные
         if len(diversified) < self.final_top_n and len(candidates) > len(diversified):
             for candidate in candidates:
                 if candidate not in diversified:
@@ -246,8 +220,11 @@ class Ranker:
     def _get_movie_similarity(self, movie_id1: str, movie_id2: str) -> float:
         """Получение схожести двух фильмов"""
         try:
-            if hasattr(self.models, 'get_movie_similarity'):
-                return self.models.get_movie_similarity(movie_id1, movie_id2)
+            if hasattr(self.models, 'get_similar_movies'):
+                similar = self.models.get_similar_movies(movie_id1, 100)
+                for sim in similar:
+                    if sim.get('movie_id') == movie_id2:
+                        return sim.get('similarity', 0)
             return 0
         except:
             return 0

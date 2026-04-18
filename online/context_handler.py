@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import pandas as pd
@@ -122,11 +123,54 @@ class ContextHandler:
         }
 
     def get_user_genre_preferences(self, user_id: str) -> Dict:
-        """Получение жанровых предпочтений пользователя"""
-        profile = self._get_user_profile(user_id)
-        if profile and 'top_genres' in profile:
-            return {g['genre']: g.get('normalized_weight', 1) for g in profile['top_genres']}
-        return {}
+        """Получение жанровых предпочтений пользователя на основе его оценок"""
+        try:
+            history = self._get_user_history(user_id)
+            if not history:
+                logger.info(f"Нет истории для пользователя {user_id}")
+                return {}
+
+            genre_ratings = defaultdict(list)
+            genre_counts = defaultdict(int)
+
+            for movie in history:
+                rating = movie.get('rating')
+                if rating is None or rating == 0:
+                    continue
+
+                movie_id = movie.get('movie_id')
+                if movie_id and self.data_provider and hasattr(self.data_provider, 'movies_df'):
+                    # Получаем жанры фильма
+                    movie_data = self.data_provider.movies_df[self.data_provider.movies_df['movie_id'] == movie_id]
+                    if len(movie_data) > 0:
+                        genres = str(movie_data.iloc[0].get('genre', ''))
+                        for genre in genres.split(','):
+                            genre = genre.strip()
+                            if genre:
+                                genre_ratings[genre].append(float(rating))
+                                genre_counts[genre] += 1
+
+            # Вычисляем среднюю оценку по жанрам
+            genre_prefs = {}
+            for genre, ratings in genre_ratings.items():
+                if len(ratings) >= 1:  # Минимум 1 оценка
+                    avg_rating = sum(ratings) / len(ratings)
+                    # Нормализуем от 0 до 1 (оценки от 1 до 10)
+                    normalized = (avg_rating - 1) / 9
+                    # Учитываем количество просмотров
+                    count_weight = min(1.0, genre_counts[genre] / 5)  # До 5 просмотров дают максимум веса
+                    final_score = normalized * (0.7 + 0.3 * count_weight)
+                    genre_prefs[genre] = max(0, min(1, final_score))
+
+            # Сортируем и берем топ-10 жанров
+            sorted_genres = sorted(genre_prefs.items(), key=lambda x: x[1], reverse=True)[:10]
+
+            logger.info(f"Жанровые предпочтения для {user_id}: {dict(sorted_genres)}")
+            return dict(sorted_genres)
+
+        except Exception as e:
+            logger.error(f"Ошибка получения жанровых предпочтений: {e}")
+            return {}
 
     def get_user_year_preferences(self, user_id: str) -> Dict:
         """Получение предпочтений по годам"""

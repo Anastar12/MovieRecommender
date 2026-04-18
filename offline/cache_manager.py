@@ -77,9 +77,9 @@ class CacheManager:
             self.redis_client.setex(key, self.cache_ttl, serialized)
             logger.debug(f"Закэшированы рекомендации для {user_id}")
 
-    def get_cached_top_n(self, user_id: str) -> Optional[List[Dict]]:
+    def get_cached_top_n(self, user_id: str, force_refresh: bool = False) -> Optional[List[Dict]]:
         """Получение кэшированных топ-N рекомендаций"""
-        if not self.redis_client:
+        if not self.redis_client or force_refresh:
             return None
 
         key = self._get_top_n_key(user_id)
