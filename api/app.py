@@ -1722,22 +1722,48 @@ def get_catalog():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/movies/<movie_id>', methods=['GET'])
+@app.route('/api/movies/<path:movie_id>', methods=['GET'])
+@app.route('/api/movie/<path:movie_id>', methods=['GET'])
 def get_movie_details_api(movie_id):
     """API для получения деталей фильма"""
     if recommender is None:
         return jsonify({'error': 'Система не инициализирована'}), 500
 
     try:
+        # Очищаем movie_id от лишних символов
+        movie_id = unquote(movie_id)  # Декодируем URL
+        movie_id = movie_id.strip()
+
+        # Извлекаем ID из URL, если передан полный URL
+        import re
+        match = re.search(r'(tt\d+)', movie_id)
+        if match:
+            movie_id = match.group(1)
+
+        logger.info(f"Получение деталей фильма: {movie_id}")
+
+        # Проверяем, что movie_id валидный
+        if not movie_id or movie_id == 'nan' or movie_id == 'undefined':
+            logger.error(f"Невалидный movie_id: {movie_id}")
+            return jsonify({'error': 'Неверный идентификатор фильма'}), 400
+
         movie = recommender.get_movie_details(movie_id)
         if movie is None:
+            logger.warning(f"Фильм {movie_id} не найден")
             return jsonify({'error': f'Фильм {movie_id} не найден'}), 404
 
         movie['poster'] = get_poster_filename(movie.get('title', ''), movie.get('year', ''))
+
+        # Добавляем рейтинг IMDb, если его нет
+        if 'imdb_rating' not in movie or movie['imdb_rating'] is None:
+            movie['imdb_rating'] = movie.get('imdb', None)
+
         return jsonify(movie)
 
     except Exception as e:
         logger.error(f"Ошибка при получении фильма {movie_id}: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
@@ -1820,21 +1846,48 @@ def search_movies_api():
     query = request.args.get('q', '')
     limit = int(request.args.get('limit', 20))
 
+    # Декодируем query, если пришло в URL-encoded формате
+    if query:
+        query = unquote(query)  # Декодируем русские символы
+        query = query.strip()
+
+    logger.info(f"Поиск по запросу: '{query}'")
+
     if models_provider is None or models_provider.movies_df is None:
         return jsonify({'error': 'Система не инициализирована'}), 500
 
     try:
         movies_df = models_provider.movies_df.copy()
 
-        mask = (
-                movies_df['title'].str.contains(query, case=False, na=False) |
-                movies_df['title_ru'].str.contains(query, case=False, na=False)
-        )
+        # Создаем маску для поиска по русским и английским названиям
+        mask = pd.Series([False] * len(movies_df))
+
+        if 'title_ru' in movies_df.columns:
+            mask = mask | movies_df['title_ru'].str.contains(query, case=False, na=False, regex=False)
+
+        if 'title' in movies_df.columns:
+            mask = mask | movies_df['title'].str.contains(query, case=False, na=False, regex=False)
+
+        # Также ищем по оригинальному названию (если есть)
+        if 'original_title' in movies_df.columns:
+            mask = mask | movies_df['original_title'].str.contains(query, case=False, na=False, regex=False)
 
         result_df = movies_df[mask].head(limit)
 
+        # Логируем количество найденных результатов
+        logger.info(f"Найдено {len(result_df)} фильмов по запросу '{query}'")
+
         movies = []
         for _, row in result_df.iterrows():
+            movie_id = row.get('movie_id')
+            if pd.isna(movie_id) or movie_id is None:
+                continue
+
+            # Убеждаемся, что movie_id - строка
+            movie_id = str(movie_id).strip()
+            if not movie_id or movie_id == 'nan':
+                continue
+
             # Получаем русские названия жанров
             genres_ru = []
             genre_val = row.get('genre', '')
@@ -1854,20 +1907,30 @@ def search_movies_api():
                                     genre_ru = match.iloc[0]['genre_ru']
                         genres_ru.append(genre_ru)
 
+            # Получаем рейтинг
+            imdb_rating = None
+            if 'imdb' in row and pd.notna(row['imdb']):
+                try:
+                    imdb_rating = float(row['imdb'])
+                except:
+                    pass
+
             movies.append({
-                'movie_id': str(row.get('movie_id', '')),
+                'movie_id': movie_id,  # Убеждаемся, что это строка с ID
                 'title': str(row.get('title', '')),
                 'title_ru': str(row.get('title_ru', row.get('title', ''))),
                 'year': str(row.get('year', '')) if pd.notna(row.get('year')) else None,
                 'poster': get_poster_filename(row.get('title', ''), row.get('year', '')),
-                'genres': genres_ru,  # Добавляем массив жанров
-                'imdb_rating': float(row['imdb']) if pd.notna(row.get('imdb')) else None,  # Добавляем рейтинг
+                'genres': genres_ru,
+                'imdb_rating': imdb_rating,
             })
 
         return jsonify({'movies': movies})
 
     except Exception as e:
         logger.error(f"Ошибка при поиске: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
