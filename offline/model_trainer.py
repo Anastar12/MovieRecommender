@@ -390,37 +390,37 @@ class ModelTrainer:
 
         # Сохраняем модели
         if self.svd_model is not None:
-            with open(f'{self.models_path}svd_model.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'svd_model.pkl'), 'wb') as f:
                 pickle.dump(self.svd_model, f)
-            np.save(f'{self.models_path}user_factors.npy', self.user_factors)
-            np.save(f'{self.models_path}item_factors.npy', self.item_factors)
+            np.save(os.path.join(self.models_path, 'user_factors.npy'), self.user_factors)
+            np.save(os.path.join(self.models_path, 'item_factors.npy'), self.item_factors)
             logger.info("SVD модель сохранена")
 
         if self.nmf_model is not None:
-            with open(f'{self.models_path}nmf_model.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'nmf_model.pkl'), 'wb') as f:
                 pickle.dump(self.nmf_model, f)
             if self.user_factors_nmf is not None:
-                np.save(f'{self.models_path}user_factors_nmf.npy', self.user_factors_nmf)
-                np.save(f'{self.models_path}item_factors_nmf.npy', self.item_factors_nmf)
+                np.save(os.path.join(self.models_path, 'user_factors_nmf.npy'), self.user_factors_nmf)
+                np.save(os.path.join(self.models_path, 'item_factors_nmf.npy'), self.item_factors_nmf)
             logger.info("NMF модель сохранена")
 
         if self.als_model is not None:
-            with open(f'{self.models_path}als_model.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'als_model.pkl'), 'wb') as f:
                 pickle.dump(self.als_model, f)
             logger.info("ALS модель сохранена")
 
         if self.rating_predictor is not None:
-            with open(f'{self.models_path}rating_predictor.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'rating_predictor.pkl'), 'wb') as f:
                 pickle.dump(self.rating_predictor, f)
             logger.info("Модель предсказания сохранена")
 
         if self.ranking_model is not None:
-            with open(f'{self.models_path}ranking_model.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'ranking_model.pkl'), 'wb') as f:
                 pickle.dump(self.ranking_model, f)
             logger.info("Модель ранжирования сохранена")
 
         if self.nn_model is not None:
-            with open(f'{self.models_path}nn_model.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'nn_model.pkl'), 'wb') as f:
                 pickle.dump(self.nn_model, f)
             logger.info("Индекс схожести сохранен")
 
@@ -452,46 +452,46 @@ class ModelTrainer:
 
         try:
             # Загрузка SVD
-            svd_path = f'{self.models_path}svd_model.pkl'
+            svd_path = os.path.join(self.models_path, 'svd_model.pkl')
             if os.path.exists(svd_path):
                 with open(svd_path, 'rb') as f:
                     self.svd_model = pickle.load(f)
-                self.user_factors = np.load(f'{self.models_path}user_factors.npy')
-                self.item_factors = np.load(f'{self.models_path}item_factors.npy')
+                self.user_factors = np.load(os.path.join(self.models_path, 'user_factors.npy'))
+                self.item_factors = np.load(os.path.join(self.models_path, 'item_factors.npy'))
                 logger.info("SVD модель загружена")
 
             # Загрузка NMF
-            nmf_path = f'{self.models_path}nmf_model.pkl'
+            nmf_path = os.path.join(self.models_path, 'nmf_model.pkl')
             if os.path.exists(nmf_path):
                 with open(nmf_path, 'rb') as f:
                     self.nmf_model = pickle.load(f)
-                if os.path.exists(f'{self.models_path}user_factors_nmf.npy'):
-                    self.user_factors_nmf = np.load(f'{self.models_path}user_factors_nmf.npy')
-                    self.item_factors_nmf = np.load(f'{self.models_path}item_factors_nmf.npy')
+                if os.path.exists(os.path.join(self.models_path, 'user_factors_nmf.npy')):
+                    self.user_factors_nmf = np.load(os.path.join(self.models_path, 'user_factors_nmf.npy'))
+                    self.item_factors_nmf = np.load(os.path.join(self.models_path, 'item_factors_nmf.npy'))
                 logger.info("NMF модель загружена")
 
             # Загрузка ALS
-            als_path = f'{self.models_path}als_model.pkl'
+            als_path = os.path.join(self.models_path, 'als_model.pkl')
             if os.path.exists(als_path):
                 with open(als_path, 'rb') as f:
                     self.als_model = pickle.load(f)
                 logger.info("ALS модель загружена")
 
             # Загрузка моделей предсказания
-            rating_path = f'{self.models_path}rating_predictor.pkl'
+            rating_path = os.path.join(self.models_path, 'rating_predictor.pkl')
             if os.path.exists(rating_path):
                 with open(rating_path, 'rb') as f:
                     self.rating_predictor = pickle.load(f)
                 logger.info("Модель предсказания загружена")
 
-            ranking_path = f'{self.models_path}ranking_model.pkl'
+            ranking_path = os.path.join(self.models_path, 'ranking_model.pkl')
             if os.path.exists(ranking_path):
                 with open(ranking_path, 'rb') as f:
                     self.ranking_model = pickle.load(f)
                 logger.info("Модель ранжирования загружена")
 
             # Загрузка индекса схожести
-            nn_path = f'{self.models_path}nn_model.pkl'
+            nn_path = os.path.join(self.models_path, 'nn_model.pkl')
             if os.path.exists(nn_path):
                 with open(nn_path, 'rb') as f:
                     self.nn_model = pickle.load(f)

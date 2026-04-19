@@ -204,7 +204,7 @@ class CandidateGenerator:
         """Находит пользователей с похожими оценками"""
         try:
             # Загружаем все ревью
-            reviews_path = 'models/reviews_df.pkl'
+            reviews_path = os.path.join(self.models.models_path, 'reviews_df.pkl') if hasattr(self.models, 'models_path') else 'models/reviews_df.pkl'
 
             if os.path.exists(reviews_path):
                 reviews_df = pd.read_pickle(reviews_path)

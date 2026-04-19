@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class ModelVersioning:
     """Система версионирования моделей с проверкой изменений данных"""
 
-    def __init__(self, models_path: str = 'api/models/'):
+    def __init__(self, models_path: str = 'models/'):
         self.models_path = models_path
         self.version_file = os.path.join(models_path, 'model_version.json')
 

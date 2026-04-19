@@ -532,48 +532,48 @@ class DataPipeline:
         """Сохраняет обработанные данные"""
         logger.info("Сохранение обработанных данных...")
 
-        # Сохранение DataFrame'ов
-        data['movies_df'].to_pickle(f'{self.models_path}movies_df.pkl')
+        # Сохранение DataFrame
+        data['movies_df'].to_pickle(os.path.join(self.models_path, 'movies_df.pkl'))
         if data['reviews_df'] is not None:
-            data['reviews_df'].to_pickle(f'{self.models_path}reviews_df.pkl')
+            data['reviews_df'].to_pickle(os.path.join(self.models_path, 'reviews_df.pkl'))
         if data['user_main_df'] is not None:
-            data['user_main_df'].to_pickle(f'{self.models_path}user_main_df.pkl')
+            data['user_main_df'].to_pickle(os.path.join(self.models_path, 'user_main_df.pkl'))
         if data['genres_df'] is not None:
-            data['genres_df'].to_pickle(f'{self.models_path}genres_df.pkl')
+            data['genres_df'].to_pickle(os.path.join(self.models_path, 'genres_df.pkl'))
 
         # Сохранение векторизаторов и матриц
-        with open(f'{self.models_path}tfidf_vectorizer.pkl', 'wb') as f:
+        with open(os.path.join(self.models_path, 'tfidf_vectorizer.pkl'), 'wb') as f:
             pickle.dump(data['tfidf_vectorizer'], f)
 
-        save_npz(f'{self.models_path}tfidf_matrix.npz', data['tfidf_matrix'])
-        save_npz(f'{self.models_path}genre_vectors.npz', data['genre_vectors'])
-        save_npz(f'{self.models_path}actor_vectors.npz', data['actor_vectors'])
-        save_npz(f'{self.models_path}director_vectors.npz', data['director_vectors'])
-        save_npz(f'{self.models_path}combined_features.npz', data['combined_features'])
+        save_npz(os.path.join(self.models_path, 'tfidf_matrix.npz'), data['tfidf_matrix'])
+        save_npz(os.path.join(self.models_path, 'genre_vectors.npz'), data['genre_vectors'])
+        save_npz(os.path.join(self.models_path, 'actor_vectors.npz'), data['actor_vectors'])
+        save_npz(os.path.join(self.models_path, 'director_vectors.npz'), data['director_vectors'])
+        save_npz(os.path.join(self.models_path, 'combined_features.npz'), data['combined_features'])
 
         if data['user_item_matrix'] is not None:
-            save_npz(f'{self.models_path}user_item_matrix.npz', data['user_item_matrix'])
+            save_npz(os.path.join(self.models_path, 'user_item_matrix.npz'), data['user_item_matrix'])
 
         # Сохранение массивов
-        np.save(f'{self.models_path}popularity_scores.npy', data['popularity_scores'])
-        np.save(f'{self.models_path}recency_scores.npy', data['recency_scores'])
+        np.save(os.path.join(self.models_path, 'popularity_scores.npy'), data['popularity_scores'])
+        np.save(os.path.join(self.models_path, 'recency_scores.npy'), data['recency_scores'])
 
         # Сохранение списков
-        with open(f'{self.models_path}movie_ids.pkl', 'wb') as f:
+        with open(os.path.join(self.models_path, 'movie_ids.pkl'), 'wb') as f:
             pickle.dump(data['movies_df']['movie_id'].dropna().tolist(), f)
 
         if data['user_indices'] is not None:
-            with open(f'{self.models_path}user_indices.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'user_indices.pkl'), 'wb') as f:
                 pickle.dump(data['user_indices'], f)
-            with open(f'{self.models_path}movie_indices.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'movie_indices.pkl'), 'wb') as f:
                 pickle.dump(data['movie_indices'], f)
-            with open(f'{self.models_path}user_list.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'user_list.pkl'), 'wb') as f:
                 pickle.dump(data['user_list'], f)
-            with open(f'{self.models_path}movie_list.pkl', 'wb') as f:
+            with open(os.path.join(self.models_path, 'movie_list.pkl'), 'wb') as f:
                 pickle.dump(data['movie_list'], f)
 
         # Сохранение хеша
-        with open(f'{self.models_path}data_hash.txt', 'w') as f:
+        with open(os.path.join(self.models_path, 'data_hash.txt'), 'w') as f:
             f.write(data['data_hash'])
 
         # Сохранение метаданных
@@ -586,7 +586,7 @@ class DataPipeline:
             'num_reviews': len(data['reviews_df']) if data['reviews_df'] is not None else 0
         }
 
-        with open(f'{self.models_path}metadata.pkl', 'wb') as f:
+        with open(os.path.join(self.models_path, 'metadata.pkl'), 'wb') as f:
             pickle.dump(metadata, f)
 
         logger.info("Данные сохранены")

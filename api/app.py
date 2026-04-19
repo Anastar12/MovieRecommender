@@ -100,9 +100,9 @@ class ModelsProvider:
 
         # Загрузка данных
         try:
-            self.movies_df = pd.read_pickle(f'{self.trainer.models_path}movies_df.pkl')
-            self.user_main_df = pd.read_pickle(f'{self.trainer.models_path}user_main_df.pkl')
-            self.genres_df = pd.read_pickle(f'{self.trainer.models_path}genres_df.pkl')
+            self.movies_df = pd.read_pickle(os.path.join(self.trainer.models_path, 'movies_df.pkl'))
+            self.user_main_df = pd.read_pickle(os.path.join(self.trainer.models_path, 'user_main_df.pkl'))
+            self.genres_df = pd.read_pickle(os.path.join(self.trainer.models_path, 'genres_df.pkl'))
         except Exception as e:
             logger.error(f"Ошибка загрузки данных: {e}")
             self.movies_df = None
@@ -124,7 +124,8 @@ class ModelsProvider:
 
                     # Загрузка subgenres
                     try:
-                        self.subgenres_df = pd.read_pickle(f'{provider.trainer.models_path}subgenres_df.pkl')
+                        self.subgenres_df = pd.read_pickle(
+                            os.path.join(provider.trainer.models_path, 'subgenres_df.pkl'))
                     except:
                         pass
 
@@ -210,8 +211,7 @@ class ModelsProvider:
 
                             # Загружаем таблицу стран, если ещё не загружена
                             countries_df = None
-                            countries_path = f'{self.provider.trainer.models_path}countries_df.pkl' if hasattr(self,
-                                                                                                               'provider') else None
+                            countries_path = os.path.join(self.provider.trainer.models_path, 'countries_df.pkl')
                             if countries_path and os.path.exists(countries_path):
                                 try:
                                     countries_df = pd.read_pickle(countries_path)
@@ -253,7 +253,6 @@ class ModelsProvider:
                         countries_ru = [country_ru_val]
 
                     # Если совсем ничего нет, оставляем пустой массив
-                    # ========== КОНЕЦ НОВОГО КОДА ==========
 
                     return {
                         'movie_id': str(movie_id),
@@ -336,7 +335,7 @@ class ModelsProvider:
 
             # Загрузка reviews_df для совместимости
             try:
-                reviews_path = f'{self.trainer.models_path}reviews_df.pkl'
+                reviews_path = os.path.join(self.trainer.models_path, 'reviews_df.pkl')
                 if os.path.exists(reviews_path):
                     reviews_df = pd.read_pickle(reviews_path)
                 else:
@@ -489,16 +488,14 @@ class ModelsProvider:
 
 class DataProvider:
     """Провайдер данных для онлайн-компонентов"""
-
     def __init__(self, data_pipeline: DataPipeline):
         self.data = data_pipeline
         self.connection = data_pipeline.connection
 
         # Загрузка данных
-        movies_path = f'{self.data.models_path}movies_df.pkl'
+        movies_path = os.path.join(self.data.models_path, 'movies_df.pkl')
         self.movies_df = pd.read_pickle(movies_path) if os.path.exists(movies_path) else None
-        self.user_main_df = pd.read_pickle(f'{self.data.models_path}user_main_df.pkl') if os.path.exists(
-            f'{self.data.models_path}user_main_df.pkl') else None
+        self.user_main_df = pd.read_pickle(os.path.join(self.data.models_path, 'user_main_df.pkl')) if os.path.exists(os.path.join(self.data.models_path, 'user_main_df.pkl')) else None
 
     def get_user_stats(self, user_id: str) -> Dict:
         """Получение статистики пользователя"""
@@ -833,7 +830,7 @@ def setup_app():
 
         # 4. Обновляем глобальные переменные
         # Загружаем reviews_df для совместимости
-        reviews_path = f'{model_trainer.models_path}reviews_df.pkl'
+        reviews_path = os.path.join(model_trainer.models_path, 'reviews_df.pkl')
         if os.path.exists(reviews_path):
             reviews_df = pd.read_pickle(reviews_path)
             logger.info(f"Загружено {len(reviews_df)} ревью")
