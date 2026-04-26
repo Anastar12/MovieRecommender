@@ -34,55 +34,42 @@ class CandidateGenerator:
         user_id = context['user_id']
         candidates = defaultdict(float)
 
-        # Получаем историю оценок пользователя
+        # Получаем историю оценок пользователя (МНОЖЕСТВО для быстрого поиска)
         user_rated_movies = context.get('user_rated_movies', set())
+
+        # Дополнительно получаем из контекста, если есть
+        if 'user_rated_movies_set' not in context:
+            # Преобразуем в множество, если это список
+            if isinstance(user_rated_movies, list):
+                user_rated_movies = set(user_rated_movies)
+            context['user_rated_movies_set'] = user_rated_movies
+
+        user_rated_movies_set = context.get('user_rated_movies_set', set())
+
         user_genres = context.get('user_genre_preferences', {})
 
-        # Для новых пользователей или с малым количеством оценок - используем жанровую персонализацию
-        if len(user_rated_movies) < 10:
+        logger.info(f"У пользователя {user_id} просмотрено фильмов: {len(user_rated_movies_set)}")
+
+        # Для новых пользователей или с малым количеством оценок
+        if len(user_rated_movies_set) < 3:
             logger.info(
-                f"Пользователь {user_id} имеет {len(user_rated_movies)} оценок, используем жанровую персонализацию")
-
-            if user_genres:
-                # Персонализация на основе жанров
-                genre_candidates = await self._get_genre_based_candidates(user_genres, context)
-                for movie_id, score in genre_candidates:
-                    if movie_id not in user_rated_movies:
-                        candidates[movie_id] += score * 0.7  # Высокий вес для жанров
-
-                # Добавляем немного популярных для разнообразия
-                popular = await self._get_popular_candidates(context)
-                for movie in popular[:20]:
-                    if movie['movie_id'] not in user_rated_movies:
-                        candidates[movie['movie_id']] += movie.get('score', 0.5) * 0.3
-            else:
-                # Нет жанровых предпочтений - используем популярные
-                return await self._get_popular_candidates(context)
-
-            if candidates:
-                return self._deduplicate_and_sort(dict(candidates), context)
+                f"Пользователь {user_id} имеет {len(user_rated_movies_set)} оценок, используем популярные фильмы")
+            popular = await self._get_popular_candidates(context)
+            # Фильтруем популярные от просмотренных
+            filtered_popular = [p for p in popular if p['movie_id'] not in user_rated_movies_set]
+            return filtered_popular[:self.candidate_limit]
 
         # Для активных пользователей - полная персонализация
         logger.info(
-            f"Генерация персонализированных кандидатов для {user_id}, оценено фильмов: {len(user_rated_movies)}")
+            f"Генерация персонализированных кандидатов для {user_id}, оценено фильмов: {len(user_rated_movies_set)}")
 
         # Параллельный сбор кандидатов
         tasks = []
 
-        if self.weights.get('collaborative', 0) > 0:
-            tasks.append(self._get_collaborative_candidates(user_id, user_rated_movies))
-
-        if self.weights.get('svd', 0) > 0:
-            tasks.append(self._get_svd_candidates(user_id))
-
-        if self.weights.get('als', 0) > 0:
-            tasks.append(self._get_als_candidates(user_id))
-
         if self.weights.get('content', 0) > 0:
-            recent_movies = list(user_rated_movies)[:10] if user_rated_movies else []
+            recent_movies = list(user_rated_movies_set)[:10] if user_rated_movies_set else []
             tasks.append(self._get_content_candidates_from_history(recent_movies))
 
-        # Жанровые кандидаты для усиления персонализации
         if user_genres:
             tasks.append(self._get_genre_based_candidates(user_genres, context))
 
@@ -97,12 +84,13 @@ class CandidateGenerator:
 
             if result:
                 for movie_id, score in result:
-                    if movie_id not in user_rated_movies:
+                    if movie_id not in user_rated_movies_set:
                         candidates[movie_id] += score
 
         if not candidates:
             logger.warning(f"Нет кандидатов для {user_id}, используем популярные")
-            return await self._get_popular_candidates(context)
+            popular = await self._get_popular_candidates(context)
+            return [p for p in popular if p['movie_id'] not in user_rated_movies_set][:self.candidate_limit]
 
         return self._deduplicate_and_sort(candidates, context)
 
@@ -163,51 +151,58 @@ class CandidateGenerator:
     async def _get_collaborative_candidates(self, user_id: str, user_rated_movies: set) -> List[Tuple[str, float]]:
         """User-based collaborative filtering - поиск похожих пользователей"""
         try:
-            # Получаем всех пользователей с их оценками
-            if self.data and hasattr(self.data, 'user_main_df') and self.data.user_main_df is not None:
-                user_df = self.data.user_main_df
+            # Получаем оценки текущего пользователя
+            user_ratings = {}
+            if hasattr(self.data, 'get_user_watched_movies'):
+                for movie in self.data.get_user_watched_movies(user_id):
+                    rating = movie.get('rating')
+                    movie_id = movie.get('movie_id')
+                    if rating is not None and rating > 0 and movie_id:
+                        try:
+                            user_ratings[movie_id] = float(rating)
+                        except:
+                            pass
 
-                # Находим пользователя
-                user_data = user_df[user_df['user_url'] == user_id]
-                if len(user_data) == 0:
-                    return []
+            if not user_ratings:
+                return []
 
-                # Получаем оценки других пользователей из reviews_df
-                if hasattr(self.data, 'get_user_watched_movies'):
-                    # Получаем оценки текущего пользователя
-                    user_ratings = {}
-                    for movie in self.data.get_user_watched_movies(user_id):
-                        if movie.get('rating') and movie.get('movie_id'):
-                            user_ratings[movie['movie_id']] = float(movie['rating'])
+            # Устанавливаем текущего пользователя для метода _find_similar_users
+            self._current_user_id = user_id
 
-                    if not user_ratings:
-                        return []
+            # Находим похожих пользователей
+            similar_users = self._find_similar_users(user_ratings)
 
-                    # Находим похожих пользователей
-                    similar_users = self._find_similar_users(user_ratings)
+            # Собираем рекомендации от похожих пользователей
+            recommendations = self._aggregate_from_similar_users(similar_users, user_ratings)
 
-                    # Собираем рекомендации от похожих пользователей
-                    recommendations = self._aggregate_from_similar_users(similar_users, user_ratings)
-
-                    # Нормализуем и применяем вес
-                    max_score = max([s for _, s in recommendations]) if recommendations else 1
-                    return [(m_id, (score / max_score) * self.weights['collaborative'])
-                            for m_id, score in recommendations[:self.per_method_limit]]
+            # Нормализуем и применяем вес
+            if recommendations:
+                max_score = max(recommendations.values())
+                return [(m_id, (score / max_score) * self.weights['collaborative'])
+                        for m_id, score in recommendations.items()][:self.per_method_limit]
 
             return []
 
         except Exception as e:
             logger.error(f"Ошибка collaborative filtering: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def _find_similar_users(self, user_ratings: Dict[str, float], top_n: int = 20) -> List[Tuple[str, float]]:
         """Находит пользователей с похожими оценками"""
         try:
             # Загружаем все ревью
-            reviews_path = os.path.join(self.models.models_path, 'reviews_df.pkl') if hasattr(self.models, 'models_path') else 'models/reviews_df.pkl'
+            reviews_path = os.path.join(self.models.models_path, 'reviews_df.pkl') if hasattr(self.models,
+                                                                                              'models_path') else 'models/reviews_df.pkl'
 
             if os.path.exists(reviews_path):
                 reviews_df = pd.read_pickle(reviews_path)
+
+                # Проверяем наличие колонки user_url_normalized
+                if 'user_url_normalized' not in reviews_df.columns:
+                    logger.warning("Нет колонки user_url_normalized в reviews_df")
+                    return []
 
                 # Группируем по пользователям
                 user_vectors = {}
@@ -220,7 +215,12 @@ class CandidateGenerator:
                         movie_id = row.get('movie_id')
                         rating = row.get('rating')
                         if movie_id and pd.notna(rating) and rating > 0:
-                            ratings_dict[str(movie_id)] = float(rating)
+                            # Преобразуем rating в число
+                            try:
+                                rating_val = float(rating)
+                                ratings_dict[str(movie_id)] = rating_val
+                            except:
+                                continue
 
                     if ratings_dict:
                         user_vectors[user_url] = ratings_dict
@@ -229,8 +229,15 @@ class CandidateGenerator:
                 similarities = []
                 user_movies = set(user_ratings.keys())
 
+                # Получаем текущего пользователя (нужно передать его ID)
+                current_user = None
+
+                if not hasattr(self, '_current_user_id'):
+                    logger.warning("current_user_id не установлен")
+                    return []
+
                 for other_user, other_ratings in user_vectors.items():
-                    if other_user == user_id:
+                    if other_user == self._current_user_id:
                         continue
 
                     # Находим общие фильмы
@@ -254,6 +261,8 @@ class CandidateGenerator:
             return []
         except Exception as e:
             logger.error(f"Ошибка поиска похожих пользователей: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def _pearson_correlation(self, x: List[float], y: List[float]) -> float:
@@ -298,9 +307,12 @@ class CandidateGenerator:
             if hasattr(self.models, 'get_svd_recommendations'):
                 recs = self.models.get_svd_recommendations(user_id, self.per_method_limit)
                 if recs:
-                    max_score = max([r.get('score', 0) for r in recs]) if recs else 1
-                    return [(r['movie_id'], (r.get('score', 0) / max_score) * self.weights['svd'])
-                            for r in recs if r.get('score', 0) > 0]
+                    # Проверяем, что есть оценки
+                    scores = [r.get('score', 0) for r in recs if r.get('score', 0) > 0]
+                    if scores:
+                        max_score = max(scores)
+                        return [(r['movie_id'], (r.get('score', 0) / max_score) * self.weights['svd'])
+                                for r in recs if r.get('score', 0) > 0]
         except Exception as e:
             logger.error(f"Ошибка SVD: {e}")
         return []
@@ -311,9 +323,11 @@ class CandidateGenerator:
             if hasattr(self.models, 'get_als_recommendations'):
                 recs = self.models.get_als_recommendations(user_id, self.per_method_limit)
                 if recs:
-                    max_score = max([r.get('score', 0) for r in recs]) if recs else 1
-                    return [(r['movie_id'], (r.get('score', 0) / max_score) * self.weights['als'])
-                            for r in recs if r.get('score', 0) > 0]
+                    scores = [r.get('score', 0) for r in recs if r.get('score', 0) > 0]
+                    if scores:
+                        max_score = max(scores)
+                        return [(r['movie_id'], (r.get('score', 0) / max_score) * self.weights['als'])
+                                for r in recs if r.get('score', 0) > 0]
         except Exception as e:
             logger.error(f"Ошибка ALS: {e}")
         return []

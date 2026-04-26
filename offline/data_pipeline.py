@@ -66,6 +66,10 @@ class DataPipeline:
 
     def _execute_query(self, query: str, params: tuple = None) -> List[dict]:
         """Выполняет SQL запрос"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         if not self.connection:
             return []
         try:
@@ -117,6 +121,10 @@ class DataPipeline:
 
     def _load_table(self, table_name: str, columns: List[str] = None) -> pd.DataFrame:
         """Загружает таблицу из БД"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         if not self.engine:
             return pd.DataFrame()
         try:
@@ -124,13 +132,19 @@ class DataPipeline:
                 query = f"SELECT {', '.join(columns)} FROM db.{table_name}"
             else:
                 query = f"SELECT * FROM db.{table_name}"
-            return pd.read_sql(query, self.engine)
+
+            df = pd.read_sql(query, self.engine)
+            return df
         except Exception as e:
             logger.error(f"Ошибка загрузки {table_name}: {e}")
             return pd.DataFrame()
 
     def get_data_hash(self) -> str:
         """Вычисляет хеш текущего состояния данных"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             query = """
                 SELECT 
@@ -155,6 +169,11 @@ class DataPipeline:
 
     async def load_data(self) -> bool:
         """Асинхронная загрузка данных"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
+
         logger.info("Начало загрузки данных...")
 
         if not self._create_connection():
@@ -220,8 +239,25 @@ class DataPipeline:
                 url = url.split('?')[0]
                 return url
 
-            self.reviews_df['user_url_normalized'] = self.reviews_df['user_url'].apply(normalize_user_url)
-            self.reviews_df['user_url_clean'] = self.reviews_df['user_url_normalized']
+            if len(self.reviews_df) > 0 and 'user_url' in self.reviews_df.columns:
+                # Создаем копию, чтобы избежать предупреждений
+                self.reviews_df = self.reviews_df.copy()
+
+                # Нормализуем user_url
+                def normalize_user_url(url):
+                    if pd.isna(url):
+                        return ''
+                    url = str(url).strip()
+                    url = url.replace('https://www.imdb.com', '')
+                    url = url.replace('http://www.imdb.com', '')
+                    url = url.rstrip('/')
+                    url = url.split('?')[0]
+                    return url
+
+                self.reviews_df.loc[:, 'user_url_normalized'] = self.reviews_df['user_url'].apply(normalize_user_url)
+                self.reviews_df.loc[:, 'user_url_clean'] = self.reviews_df['user_url_normalized']
+
+                logger.info(f"Создана нормализованная колонка user_url_normalized")
 
             logger.info(f"Создана нормализованная колонка user_url_normalized")
 
@@ -231,6 +267,10 @@ class DataPipeline:
     def preprocess_data(self):
         """Предобработка данных"""
         logger.info("Предобработка данных...")
+
+        # Создаем копию, чтобы избежать предупреждений
+        if self.movies_df is not None:
+            self.movies_df = self.movies_df.copy()
 
         # Заполнение пропусков
         text_fields = ['genre', 'plot', 'directors', 'actors', 'country',
@@ -367,9 +407,12 @@ class DataPipeline:
 
         logger.info("Создание user-item матрицы...")
 
+        # Создаем копию для безопасной работы
+        reviews_clean = self.reviews_df.copy()
+
         # Очистка данных
-        reviews_clean = self.reviews_df.dropna(subset=['user_url_clean', 'movie_id', 'rating'])
-        reviews_clean['rating'] = pd.to_numeric(reviews_clean['rating'], errors='coerce')
+        reviews_clean = reviews_clean.dropna(subset=['user_url_clean', 'movie_id', 'rating'])
+        reviews_clean.loc[:, 'rating'] = pd.to_numeric(reviews_clean['rating'], errors='coerce')
         reviews_clean = reviews_clean.dropna(subset=['rating'])
 
         if len(reviews_clean) == 0:
@@ -486,17 +529,24 @@ class DataPipeline:
         # Комбинированные признаки для схожести
         from sklearn.preprocessing import normalize
 
-        tfidf_norm = normalize(self.tfidf_matrix, norm='l2')
-        genre_norm = normalize(self.genre_vectors, norm='l2')
-        actor_norm = normalize(self.actor_vectors, norm='l2')
-        director_norm = normalize(self.director_vectors, norm='l2')
+        # Проверяем, что все компоненты существуют
+        if self.tfidf_matrix is not None and self.genre_vectors is not None and \
+                self.actor_vectors is not None and self.director_vectors is not None:
 
-        combined_features = hstack([
-            tfidf_norm * 0.4,
-            genre_norm * 0.3,
-            actor_norm * 0.2,
-            director_norm * 0.1
-        ])
+            tfidf_norm = normalize(self.tfidf_matrix, norm='l2')
+            genre_norm = normalize(self.genre_vectors, norm='l2')
+            actor_norm = normalize(self.actor_vectors, norm='l2')
+            director_norm = normalize(self.director_vectors, norm='l2')
+
+            combined_features = hstack([
+                tfidf_norm * 0.4,
+                genre_norm * 0.3,
+                actor_norm * 0.2,
+                director_norm * 0.1
+            ])
+        else:
+            logger.warning("Не все компоненты доступны для создания combined_features")
+            combined_features = None
 
         logger.info("Пайплайн обработки завершен")
 
@@ -522,9 +572,9 @@ class DataPipeline:
             'movie_indices': getattr(self, 'movie_indices', None),
             'user_list': getattr(self, 'user_list', None),
             'movie_list': getattr(self, 'movie_list', None),
-            'genre_list': self.genre_list,
-            'top_actors': self.top_actors,
-            'top_directors': self.top_directors,
+            'genre_list': getattr(self, 'genre_list', None),
+            'top_actors': getattr(self, 'top_actors', None),
+            'top_directors': getattr(self, 'top_directors', None),
             'data_hash': self.data_hash
         }
 
@@ -542,47 +592,71 @@ class DataPipeline:
             data['genres_df'].to_pickle(os.path.join(self.models_path, 'genres_df.pkl'))
 
         # Сохранение векторизаторов и матриц
-        with open(os.path.join(self.models_path, 'tfidf_vectorizer.pkl'), 'wb') as f:
-            pickle.dump(data['tfidf_vectorizer'], f)
+        if data['tfidf_vectorizer'] is not None:
+            with open(os.path.join(self.models_path, 'tfidf_vectorizer.pkl'), 'wb') as f:
+                pickle.dump(data['tfidf_vectorizer'], f)
 
-        save_npz(os.path.join(self.models_path, 'tfidf_matrix.npz'), data['tfidf_matrix'])
-        save_npz(os.path.join(self.models_path, 'genre_vectors.npz'), data['genre_vectors'])
-        save_npz(os.path.join(self.models_path, 'actor_vectors.npz'), data['actor_vectors'])
-        save_npz(os.path.join(self.models_path, 'director_vectors.npz'), data['director_vectors'])
-        save_npz(os.path.join(self.models_path, 'combined_features.npz'), data['combined_features'])
+        if data['tfidf_matrix'] is not None:
+            save_npz(os.path.join(self.models_path, 'tfidf_matrix.npz'), data['tfidf_matrix'])
 
-        if data['user_item_matrix'] is not None:
+        if data['genre_vectors'] is not None:
+            save_npz(os.path.join(self.models_path, 'genre_vectors.npz'), data['genre_vectors'])
+
+        if data['actor_vectors'] is not None:
+            save_npz(os.path.join(self.models_path, 'actor_vectors.npz'), data['actor_vectors'])
+
+        if data['director_vectors'] is not None:
+            save_npz(os.path.join(self.models_path, 'director_vectors.npz'), data['director_vectors'])
+
+        # ВАЖНО: Проверяем, что combined_features не None перед сохранением
+        if data.get('combined_features') is not None:
+            save_npz(os.path.join(self.models_path, 'combined_features.npz'), data['combined_features'])
+        else:
+            logger.warning("combined_features is None, пропускаем сохранение")
+
+        if data.get('user_item_matrix') is not None:
             save_npz(os.path.join(self.models_path, 'user_item_matrix.npz'), data['user_item_matrix'])
 
         # Сохранение массивов
-        np.save(os.path.join(self.models_path, 'popularity_scores.npy'), data['popularity_scores'])
-        np.save(os.path.join(self.models_path, 'recency_scores.npy'), data['recency_scores'])
+        if data.get('popularity_scores') is not None:
+            np.save(os.path.join(self.models_path, 'popularity_scores.npy'), data['popularity_scores'])
+
+        if data.get('recency_scores') is not None:
+            np.save(os.path.join(self.models_path, 'recency_scores.npy'), data['recency_scores'])
 
         # Сохранение списков
-        with open(os.path.join(self.models_path, 'movie_ids.pkl'), 'wb') as f:
-            pickle.dump(data['movies_df']['movie_id'].dropna().tolist(), f)
+        if 'movies_df' in data and data['movies_df'] is not None and 'movie_id' in data['movies_df'].columns:
+            with open(os.path.join(self.models_path, 'movie_ids.pkl'), 'wb') as f:
+                pickle.dump(data['movies_df']['movie_id'].dropna().tolist(), f)
 
-        if data['user_indices'] is not None:
+        if data.get('user_indices') is not None:
             with open(os.path.join(self.models_path, 'user_indices.pkl'), 'wb') as f:
                 pickle.dump(data['user_indices'], f)
+
+        if data.get('movie_indices') is not None:
             with open(os.path.join(self.models_path, 'movie_indices.pkl'), 'wb') as f:
                 pickle.dump(data['movie_indices'], f)
+
+        if data.get('user_list') is not None:
             with open(os.path.join(self.models_path, 'user_list.pkl'), 'wb') as f:
                 pickle.dump(data['user_list'], f)
+
+        if data.get('movie_list') is not None:
             with open(os.path.join(self.models_path, 'movie_list.pkl'), 'wb') as f:
                 pickle.dump(data['movie_list'], f)
 
         # Сохранение хеша
-        with open(os.path.join(self.models_path, 'data_hash.txt'), 'w') as f:
-            f.write(data['data_hash'])
+        if data.get('data_hash') is not None:
+            with open(os.path.join(self.models_path, 'data_hash.txt'), 'w') as f:
+                f.write(data['data_hash'])
 
         # Сохранение метаданных
         metadata = {
-            'genre_list': data['genre_list'],
-            'top_actors': data['top_actors'],
-            'top_directors': data['top_directors'],
-            'num_movies': len(data['movies_df']),
-            'num_users': len(data['user_list']) if data['user_list'] else 0,
+            'genre_list': data.get('genre_list', []),
+            'top_actors': data.get('top_actors', []),
+            'top_directors': data.get('top_directors', []),
+            'num_movies': len(data['movies_df']) if data['movies_df'] is not None else 0,
+            'num_users': len(data.get('user_list', [])),
             'num_reviews': len(data['reviews_df']) if data['reviews_df'] is not None else 0
         }
 
@@ -593,6 +667,11 @@ class DataPipeline:
 
     def get_data_hashes(self) -> Dict[str, str]:
         """Вычисляет хеши для всех источников данных"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
+
         hashes = {}
 
         # Хеш таблицы movies
@@ -678,7 +757,11 @@ class DataPipeline:
 
     async def save_user_rating(self, user_url: str, movie_id: str, rating: float,
                                review_text: str = None, review_title: str = None) -> bool:
-        """Сохранение оценки пользователя в БД"""
+        """Сохранение оценки пользователя в БД (rating сохраняется как TEXT)"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             if not self.connection:
                 if not self._create_connection():
@@ -691,6 +774,9 @@ class DataPipeline:
             review_hash = hashlib.md5(f"{user_url}_{movie_id}_{datetime.now().isoformat()}".encode()).hexdigest()[:16]
             review_url = f"/review/{review_hash}"
             movie_review_url = f"/title/{movie_id}/"
+
+            # Преобразуем rating в строку (сохраняем как TEXT)
+            rating_str = f"{rating:.1f}" if rating else "0"
 
             with self.connection.cursor() as cursor:
                 # Проверяем, существует ли уже оценка
@@ -708,14 +794,14 @@ class DataPipeline:
                         SET rating = %s, review_text = %s, review_title = %s, date = %s, updated_at = CURRENT_TIMESTAMP
                         WHERE user_url = %s AND movie_review_url = %s
                         RETURNING review_url
-                    """, (rating, review_text, review_title, datetime.now().date(), user_url, movie_review_url))
+                    """, (rating_str, review_text, review_title, datetime.now().date(), user_url, movie_review_url))
                 else:
                     # Вставляем новую оценку
                     cursor.execute("""
                         INSERT INTO db.reviews (review_url, movie_review_url, user_url, review_title, rating, date, review_text)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                    review_url, movie_review_url, user_url, review_title, rating, datetime.now().date(), review_text))
+                    """, (review_url, movie_review_url, user_url, review_title, rating_str, datetime.now().date(),
+                          review_text))
 
                 self.connection.commit()
 
@@ -732,6 +818,10 @@ class DataPipeline:
 
     async def add_to_watched(self, user_url: str, movie_id: str) -> bool:
         """Добавление фильма в просмотренные"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             if not self.connection:
                 if not self._create_connection():
@@ -756,6 +846,10 @@ class DataPipeline:
     async def add_to_favorites(self, user_url: str, movie_id: str) -> bool:
         """Добавление фильма в избранное"""
         try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
             if not self.connection:
                 if not self._create_connection():
                     return False
@@ -779,6 +873,10 @@ class DataPipeline:
     async def remove_from_favorites(self, user_url: str, movie_id: str) -> bool:
         """Удаление фильма из избранного"""
         try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
             if not self.connection:
                 if not self._create_connection():
                     return False
@@ -800,6 +898,10 @@ class DataPipeline:
 
     async def get_user_favorites(self, user_url: str) -> List[str]:
         """Получение списка избранных фильмов пользователя"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             if not self.connection:
                 if not self._create_connection():
@@ -830,6 +932,10 @@ class DataPipeline:
     async def get_user_watched(self, user_url: str) -> List[str]:
         """Получение списка просмотренных фильмов пользователя"""
         try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
             if not self.connection:
                 if not self._create_connection():
                     return []
@@ -858,6 +964,10 @@ class DataPipeline:
 
     async def get_user_reviewed_movies(self, user_url: str) -> List[Dict]:
         """Получение просмотренных фильмов из отзывов пользователя."""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             if not self.connection:
                 if not self._create_connection():
@@ -917,70 +1027,91 @@ class DataPipeline:
             return []
 
     async def get_user_rating(self, user_url: str, movie_id: str) -> Optional[Dict]:
-        """Получение оценки пользователя для фильма"""
+        """Получение оценки пользователя для фильма (rating как TEXT)"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             if not self.connection:
                 if not self._create_connection():
                     return None
 
             movie_review_url = f"/title/{movie_id}/"
-            normalized_user_url = self._normalize_user_url(user_url)
 
-            with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            with self.connection.cursor() as cursor:
                 cursor.execute("""
                     SELECT rating, review_text, review_title, date 
                     FROM db.reviews 
-                    WHERE (user_url = %s
-                           OR regexp_replace(
-                                replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
-                                '/+$',
-                                ''
-                           ) = %s)
-                      AND movie_review_url = %s
-                """, (user_url, normalized_user_url, movie_review_url))
+                    WHERE user_url = %s AND movie_review_url = %s
+                """, (user_url, movie_review_url))
 
                 result = cursor.fetchone()
                 if result:
-                    return dict(result)
+                    rating_value = None
+                    rating_raw = result[0]
+                    if rating_raw:
+                        try:
+                            rating_str = str(rating_raw).strip()
+                            if '/' in rating_str:
+                                rating_str = rating_str.split('/')[0].strip()
+                            rating_value = float(rating_str)
+                        except:
+                            rating_value = None
+
+                    return {
+                        'rating': rating_value,
+                        'review_text': result[1] if result[1] else '',
+                        'review_title': result[2] if result[2] else '',
+                        'date': result[3]
+                    }
                 return None
 
         except Exception as e:
             logger.error(f"Ошибка получения оценки: {e}")
-            if self.connection:
-                self.connection.rollback()
             return None
 
     async def check_movie_watched(self, user_url: str, movie_id: str) -> bool:
         """Проверка, добавлен ли фильм в просмотренные"""
         try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
             if not self.connection:
                 if not self._create_connection():
                     return False
 
-            normalized_user_url = self._normalize_user_url(user_url)
+            normalized_user_url = user_url.replace('/user/', '')
 
             with self.connection.cursor() as cursor:
                 cursor.execute("""
                     SELECT 1 FROM db.user_watched 
-                    WHERE (user_url = %s
-                           OR regexp_replace(
-                                replace(replace(split_part(user_url, '?', 1), 'https://www.imdb.com', ''), 'http://www.imdb.com', ''),
-                                '/+$',
-                                ''
-                           ) = %s)
+                    WHERE (user_url = %s OR user_url = %s OR user_url = %s)
                       AND movie_id = %s
-                """, (user_url, normalized_user_url, movie_id))
+                """, (user_url, normalized_user_url, f"/user/{normalized_user_url}", movie_id))
 
                 return cursor.fetchone() is not None
 
         except Exception as e:
             logger.error(f"Ошибка проверки просмотра: {e}")
-            if self.connection:
-                self.connection.rollback()
+            self.connection.rollback()
             return False
 
     async def check_movie_favorite(self, user_url: str, movie_id: str) -> bool:
         """Проверка, добавлен ли фильм в избранное"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             if not self.connection:
                 if not self._create_connection():
@@ -1010,6 +1141,14 @@ class DataPipeline:
 
     async def create_user(self, username: str, user_url: str = None) -> Optional[Dict]:
         """Создание нового пользователя"""
+        try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
+            self.connection.rollback()
+        except:
+            pass
         try:
             if not self.connection:
                 if not self._create_connection():
@@ -1050,12 +1189,16 @@ class DataPipeline:
     async def _update_user_stats(self, user_url: str):
         """Обновление статистики пользователя"""
         try:
+            self.connection.rollback()
+        except:
+            pass
+        try:
             with self.connection.cursor() as cursor:
-                # Подсчитываем количество оценок
+                # Подсчитываем количество оценок (игнорируем пустые или невалидные)
                 cursor.execute("""
-                    SELECT COUNT(*) as ratings_count, AVG(rating) as avg_rating
+                    SELECT COUNT(*) as ratings_count
                     FROM db.reviews 
-                    WHERE user_url = %s
+                    WHERE user_url = %s AND rating IS NOT NULL AND rating != ''
                 """, (user_url,))
 
                 result = cursor.fetchone()
@@ -1069,6 +1212,8 @@ class DataPipeline:
                 """, (ratings_count, user_url))
 
                 self.connection.commit()
+                logger.debug(f"Статистика обновлена для {user_url}: {ratings_count} оценок")
 
         except Exception as e:
             logger.error(f"Ошибка обновления статистики: {e}")
+            self.connection.rollback()

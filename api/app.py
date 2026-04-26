@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_from_directory
 import asyncio
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
 import os
@@ -9,14 +9,19 @@ from urllib.parse import unquote
 import math
 import json
 import re
+import pickle
 from datetime import datetime
 import csv
-from sqlalchemy.dialects.postgresql import psycopg2
 
-from core.config import AppConfig
+from scipy.sparse import load_npz
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from core.config import config
 from offline.data_pipeline import DataPipeline
 from offline.model_trainer import ModelTrainer
 from offline.cache_manager import CacheManager
+from online.incremental_updater import IncrementalUpdater, OnlineDataUpdater
 from online.context_handler import ContextHandler
 from online.candidate_generator import CandidateGenerator
 from online.ranker import Ranker
@@ -32,8 +37,10 @@ app.secret_key = 'your-secret-key-here'
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация компонентов
-config = AppConfig()
+# Отключаем лишние логи от sklearn и других библиотек
+logging.getLogger('sklearn').setLevel(logging.WARNING)
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('implicit').setLevel(logging.WARNING)
 
 # Офлайн-компоненты
 data_pipeline = DataPipeline(
@@ -71,6 +78,30 @@ recommender = None
 reviews_df = None
 
 
+def run_async(coro):
+    """
+    Безопасный запуск асинхронной корутины в синхронном контексте
+    """
+    try:
+        # Пытаемся получить текущий event loop
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Нет running loop, создаем новый
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+    else:
+        # Есть running loop, но мы не можем его использовать
+        # Создаем новый loop в отдельном потоке
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+
+
 def handle_nan(obj):
     """Обработчик NaN значений для JSON сериализации"""
     if isinstance(obj, float):
@@ -88,11 +119,81 @@ class ModelsProvider:
         self.trainer = trainer
         self.data = data_pipeline
 
+        # Инициализация недостающих атрибутов
+        self.popularity_scores = None
+        self.recency_scores = None
+        self.combined_features = None
+        self.movie_ids = []
+        self.movie_indices = {}
+        self.user_indices = {}
+        self.movie_list = []
+        self.user_list = []
+
         # Загрузка моделей
         self._load_models()
 
+        # Загрузка дополнительных данных
+        self._load_additional_data()
+
         # Загрузка данных для обратной совместимости
         self._load_compatibility_data()
+
+    def _load_additional_data(self):
+        """Загрузка дополнительных данных для онлайн-компонентов"""
+        try:
+            # Загрузка popularity_scores
+            pop_path = os.path.join(self.trainer.models_path, 'popularity_scores.npy')
+            if os.path.exists(pop_path):
+                self.popularity_scores = np.load(pop_path)
+                logger.info("popularity_scores загружены")
+
+            # Загрузка recency_scores
+            rec_path = os.path.join(self.trainer.models_path, 'recency_scores.npy')
+            if os.path.exists(rec_path):
+                self.recency_scores = np.load(rec_path)
+                logger.info("recency_scores загружены")
+
+            # Загрузка combined_features
+            comb_path = os.path.join(self.trainer.models_path, 'combined_features.npz')
+            if os.path.exists(comb_path):
+                self.combined_features = load_npz(comb_path)
+                logger.info("combined_features загружены")
+
+            # Загрузка списков
+            movie_ids_path = os.path.join(self.trainer.models_path, 'movie_ids.pkl')
+            if os.path.exists(movie_ids_path):
+                with open(movie_ids_path, 'rb') as f:
+                    self.movie_ids = pickle.load(f)
+                logger.info(f"movie_ids загружены: {len(self.movie_ids)}")
+
+            # Загрузка индексов
+            movie_indices_path = os.path.join(self.trainer.models_path, 'movie_indices.pkl')
+            if os.path.exists(movie_indices_path):
+                with open(movie_indices_path, 'rb') as f:
+                    self.movie_indices = pickle.load(f)
+                logger.info("movie_indices загружены")
+
+            user_indices_path = os.path.join(self.trainer.models_path, 'user_indices.pkl')
+            if os.path.exists(user_indices_path):
+                with open(user_indices_path, 'rb') as f:
+                    self.user_indices = pickle.load(f)
+                logger.info("user_indices загружены")
+
+            # Загрузка списков пользователей и фильмов
+            user_list_path = os.path.join(self.trainer.models_path, 'user_list.pkl')
+            if os.path.exists(user_list_path):
+                with open(user_list_path, 'rb') as f:
+                    self.user_list = pickle.load(f)
+                logger.info(f"user_list загружены: {len(self.user_list)}")
+
+            movie_list_path = os.path.join(self.trainer.models_path, 'movie_list.pkl')
+            if os.path.exists(movie_list_path):
+                with open(movie_list_path, 'rb') as f:
+                    self.movie_list = pickle.load(f)
+                logger.info(f"movie_list загружены: {len(self.movie_list)}")
+
+        except Exception as e:
+            logger.error(f"Ошибка загрузки дополнительных данных: {e}")
 
     def _load_models(self):
         """Загрузка моделей из файлов"""
@@ -100,12 +201,263 @@ class ModelsProvider:
 
         # Загрузка данных
         try:
-            self.movies_df = pd.read_pickle(os.path.join(self.trainer.models_path, 'movies_df.pkl'))
-            self.user_main_df = pd.read_pickle(os.path.join(self.trainer.models_path, 'user_main_df.pkl'))
-            self.genres_df = pd.read_pickle(os.path.join(self.trainer.models_path, 'genres_df.pkl'))
+            movies_path = os.path.join(self.trainer.models_path, 'movies_df.pkl')
+            if os.path.exists(movies_path):
+                self.movies_df = pd.read_pickle(movies_path)
+                logger.info(f"movies_df загружен: {len(self.movies_df)} фильмов")
+            else:
+                self.movies_df = None
+
+            user_main_path = os.path.join(self.trainer.models_path, 'user_main_df.pkl')
+            if os.path.exists(user_main_path):
+                self.user_main_df = pd.read_pickle(user_main_path)
+                logger.info(f"user_main_df загружен: {len(self.user_main_df)} пользователей")
+            else:
+                self.user_main_df = None
+
+            genres_path = os.path.join(self.trainer.models_path, 'genres_df.pkl')
+            if os.path.exists(genres_path):
+                self.genres_df = pd.read_pickle(genres_path)
+                logger.info("genres_df загружен")
+            else:
+                self.genres_df = None
+
         except Exception as e:
             logger.error(f"Ошибка загрузки данных: {e}")
             self.movies_df = None
+
+    def get_svd_recommendations(self, user_id: str, n: int = 50) -> List[Dict]:
+        """SVD рекомендации с проверкой наличия данных"""
+        if self.trainer.svd_model is None:
+            logger.warning("SVD модель не загружена")
+            return []
+
+        if not hasattr(self, 'user_indices') or self.user_indices is None:
+            logger.warning("user_indices не загружены")
+            return []
+
+        if not hasattr(self, 'movie_list') or self.movie_list is None:
+            logger.warning("movie_list не загружен")
+            return []
+
+        try:
+            if user_id not in self.user_indices:
+                logger.debug(f"Пользователь {user_id} не найден в индексах SVD")
+                return []
+
+            user_idx = self.user_indices[user_id]
+
+            # Проверяем наличие user_factors
+            if not hasattr(self.trainer, 'user_factors') or self.trainer.user_factors is None:
+                logger.warning("user_factors не загружены")
+                return []
+
+            if user_idx >= len(self.trainer.user_factors):
+                logger.warning(f"Индекс пользователя {user_idx} вне диапазона")
+                return []
+
+            user_vector = self.trainer.user_factors[user_idx]
+
+            # Проверяем наличие item_factors
+            if not hasattr(self.trainer, 'item_factors') or self.trainer.item_factors is None:
+                logger.warning("item_factors не загружены")
+                return []
+
+            predicted = user_vector @ self.trainer.item_factors.T
+
+            # Получаем топ-N индексов
+            top_indices = np.argsort(predicted)[::-1][:n]
+
+            recommendations = []
+            for idx in top_indices:
+                if idx < len(self.movie_list):
+                    movie_id = self.movie_list[idx]
+                    if self.movies_df is not None:
+                        movie = self.movies_df[self.movies_df['movie_id'] == movie_id]
+                        if len(movie) > 0:
+                            recommendations.append({
+                                'movie_id': movie_id,
+                                'title': movie.iloc[0].get('title', ''),
+                                'score': float(predicted[idx])
+                            })
+
+            return recommendations
+        except Exception as e:
+            logger.error(f"Ошибка SVD: {e}")
+            return []
+
+    def get_als_recommendations(self, user_id: str, n: int = 50) -> List[Dict]:
+        """ALS рекомендации с проверкой наличия данных"""
+        if self.trainer.als_model is None:
+            logger.warning("ALS модель не загружена")
+            return []
+
+        if not hasattr(self, 'user_indices') or self.user_indices is None:
+            logger.warning("user_indices не загружены")
+            return []
+
+        if not hasattr(self, 'movie_list') or self.movie_list is None:
+            logger.warning("movie_list не загружен")
+            return []
+
+        try:
+            if user_id not in self.user_indices:
+                logger.debug(f"Пользователь {user_id} не найден в индексах ALS")
+                return []
+
+            user_idx = self.user_indices[user_id]
+
+            # Создаем фиктивную user-item матрицу для ALS
+            # ALS модель требует матрицу для рекомендаций
+            if not hasattr(self.data, 'user_item_matrix') or self.data.user_item_matrix is None:
+                # Пробуем загрузить user_item_matrix
+                matrix_path = os.path.join(self.trainer.models_path, 'user_item_matrix.npz')
+                if os.path.exists(matrix_path):
+                    self.data.user_item_matrix = load_npz(matrix_path)
+                else:
+                    logger.warning("user_item_matrix не найдена")
+                    return []
+
+            recommendations = self.trainer.als_model.recommend(
+                user_idx,
+                self.data.user_item_matrix.T,
+                N=n
+            )
+
+            result = []
+            for movie_idx, score in recommendations:
+                if movie_idx < len(self.movie_list):
+                    movie_id = self.movie_list[movie_idx]
+                    if self.movies_df is not None:
+                        movie = self.movies_df[self.movies_df['movie_id'] == movie_id]
+                        if len(movie) > 0:
+                            result.append({
+                                'movie_id': movie_id,
+                                'title': movie.iloc[0].get('title', ''),
+                                'score': float(score)
+                            })
+
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка ALS: {e}")
+            return []
+
+    def predict_rating(self, user_id: str, movie_id: str) -> float:
+        """Предсказание оценки с правильным количеством признаков"""
+        if self.trainer.rating_predictor is None:
+            logger.debug("Модель предсказания не загружена")
+            return 0.5
+
+        try:
+            # Проверяем наличие индексов
+            if not hasattr(self, 'user_indices') or self.user_indices is None:
+                return 0.5
+            if not hasattr(self, 'movie_indices') or self.movie_indices is None:
+                return 0.5
+
+            if user_id not in self.user_indices or movie_id not in self.movie_indices:
+                return 0.5
+
+            user_idx = self.user_indices[user_id]
+            movie_idx = self.movie_indices[movie_id]
+
+            # Проверяем наличие факторов
+            if not hasattr(self.trainer, 'user_factors') or self.trainer.user_factors is None:
+                return 0.5
+            if not hasattr(self.trainer, 'item_factors') or self.trainer.item_factors is None:
+                return 0.5
+
+            if user_idx >= len(self.trainer.user_factors) or movie_idx >= len(self.trainer.item_factors):
+                return 0.5
+
+            # Определяем размерности факторов
+            user_factor_dim = min(20, self.trainer.user_factors.shape[1] if len(
+                self.trainer.user_factors.shape) > 1 else 20)
+            item_factor_dim = min(20, self.trainer.item_factors.shape[1] if len(
+                self.trainer.item_factors.shape) > 1 else 20)
+
+            # Берем первые 20 признаков (или меньше, если их нет)
+            user_vec = self.trainer.user_factors[user_idx][:user_factor_dim] if user_factor_dim > 0 else np.array(
+                [0.5] * 20)
+            item_vec = self.trainer.item_factors[movie_idx][:item_factor_dim] if item_factor_dim > 0 else np.array(
+                [0.5] * 20)
+
+            # Дополняем до 20, если нужно
+            if len(user_vec) < 20:
+                user_vec = np.pad(user_vec, (0, 20 - len(user_vec)), constant_values=0.5)
+            if len(item_vec) < 20:
+                item_vec = np.pad(item_vec, (0, 20 - len(item_vec)), constant_values=0.5)
+
+            # Формируем признаки - ВСЕГДА 72 признака
+            features_list = []
+
+            # 1. SVD признаки (40 признаков: 20 пользовательских + 20 фильмовых)
+            features_list.extend(user_vec[:20])
+            features_list.extend(item_vec[:20])
+
+            # 2. NMF признаки (30 признаков: 15 пользовательских + 15 фильмовых)
+            if hasattr(self.trainer, 'user_factors_nmf') and self.trainer.user_factors_nmf is not None:
+                if user_idx < len(self.trainer.user_factors_nmf):
+                    nmf_user = self.trainer.user_factors_nmf[user_idx][:15] if len(
+                        self.trainer.user_factors_nmf[user_idx]) >= 15 else self.trainer.user_factors_nmf[user_idx]
+                    if len(nmf_user) < 15:
+                        nmf_user = np.pad(nmf_user, (0, 15 - len(nmf_user)), constant_values=0.5)
+                    features_list.extend(nmf_user)
+                else:
+                    features_list.extend([0.5] * 15)
+            else:
+                features_list.extend([0.5] * 15)
+
+            if hasattr(self.trainer, 'item_factors_nmf') and self.trainer.item_factors_nmf is not None:
+                if movie_idx < len(self.trainer.item_factors_nmf):
+                    nmf_item = self.trainer.item_factors_nmf[movie_idx][:15] if len(
+                        self.trainer.item_factors_nmf[movie_idx]) >= 15 else self.trainer.item_factors_nmf[movie_idx]
+                    if len(nmf_item) < 15:
+                        nmf_item = np.pad(nmf_item, (0, 15 - len(nmf_item)), constant_values=0.5)
+                    features_list.extend(nmf_item)
+                else:
+                    features_list.extend([0.5] * 15)
+            else:
+                features_list.extend([0.5] * 15)
+
+            # 3. Дополнительные признаки (2 признака: популярность + свежесть)
+            if hasattr(self, 'popularity_scores') and self.popularity_scores is not None and movie_idx < len(
+                    self.popularity_scores):
+                features_list.append(float(self.popularity_scores[movie_idx]))
+            else:
+                features_list.append(0.5)
+
+            if hasattr(self, 'recency_scores') and self.recency_scores is not None and movie_idx < len(
+                    self.recency_scores):
+                features_list.append(float(self.recency_scores[movie_idx]))
+            else:
+                features_list.append(0.5)
+
+            # Проверяем количество признаков
+            expected_features = 72  # 20+20+15+15+2 = 72
+            current_features = len(features_list)
+
+            if current_features < expected_features:
+                # Дополняем до 72
+                features_list.extend([0.5] * (expected_features - current_features))
+            elif current_features > expected_features:
+                # Обрезаем до 72
+                features_list = features_list[:expected_features]
+
+            features = np.array(features_list).reshape(1, -1)
+
+            # Обработка NaN и inf
+            features = np.nan_to_num(features, nan=0.5, posinf=0.5, neginf=0.5)
+
+            # Предсказание
+            prediction = self.trainer.rating_predictor.predict(features)[0]
+            return max(0, min(1, prediction))
+
+        except Exception as e:
+            logger.error(f"Ошибка предсказания: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0.5
 
     def _load_compatibility_data(self):
         """Загрузка данных для обратной совместимости со старыми эндпоинтами"""
@@ -497,6 +849,37 @@ class DataProvider:
         self.movies_df = pd.read_pickle(movies_path) if os.path.exists(movies_path) else None
         self.user_main_df = pd.read_pickle(os.path.join(self.data.models_path, 'user_main_df.pkl')) if os.path.exists(os.path.join(self.data.models_path, 'user_main_df.pkl')) else None
 
+    def _ensure_connection(self):
+        """Проверяет и пересоздает соединение с БД при необходимости"""
+        try:
+            if self.connection is None:
+                self._create_connection()
+                return
+
+            # Проверяем, живо ли соединение
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+        except (psycopg2.InterfaceError, psycopg2.OperationalError, AttributeError) as e:
+            logger.warning(f"Соединение с БД потеряно, переподключаемся: {e}")
+            try:
+                self.connection.close()
+            except:
+                pass
+            self._create_connection()
+
+    def _create_connection(self):
+        """Создает подключение к БД для DataProvider"""
+        try:
+            if hasattr(self.data, 'db_config'):
+                self.connection = psycopg2.connect(**self.data.db_config)
+                logger.info("DataProvider: Подключение к БД установлено")
+            else:
+                logger.error("Нет конфигурации БД для DataProvider")
+                self.connection = None
+        except Exception as e:
+            logger.error(f"Ошибка подключения к БД: {e}")
+            self.connection = None
+
     def get_user_stats(self, user_id: str) -> Dict:
         """Получение статистики пользователя"""
         if self.user_main_df is None:
@@ -556,56 +939,238 @@ class DataProvider:
     def get_user_watched_movies(self, user_id: str) -> List[Dict]:
         """Получение просмотренных фильмов пользователя из PostgreSQL"""
         try:
+            self._ensure_connection()
+
             if not self.connection:
+                logger.error("Нет подключения к БД")
                 return []
 
-            async def get_watched():
-                return await self.data.get_user_watched(user_id)
+            # Извлекаем ID пользователя
+            import re
+            user_match = re.search(r'ur\d+', user_id)
+            if user_match:
+                user_login = user_match.group(0)
+            else:
+                user_login = user_id.strip('/').split('/')[-1]
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            watched_ids = loop.run_until_complete(get_watched())
-            loop.close()
+            logger.info(f"Поиск фильмов для пользователя: {user_login}")
+
+            # Все возможные форматы user_url
+            user_variants = [
+                user_login,
+                f"/user/{user_login}",
+                f"/user/{user_login}/",
+                f"/user/{user_login}?ref_=tturv_t_usr",
+                f"https://www.imdb.com/user/{user_login}",
+                f"https://www.imdb.com/user/{user_login}/",
+                f"https://www.imdb.com//user/{user_login}/",
+                user_id,
+                f"/user/ur{user_login}" if not user_login.startswith('ur') else user_login,
+            ]
+            user_variants = list(set(user_variants))
+
+            logger.debug(f"Варианты поиска: {user_variants[:5]}")
 
             watched_entries = []
-            for movie_id in watched_ids:
-                watched_entries.append({
-                    'movie_id': movie_id,
-                    'rating': None,
-                    'review_text': '',
-                    'date': None
-                })
 
-            # Fallback: если таблица user_watched пустая, берем фильмы из отзывов.
-            if not watched_entries:
-                async def get_reviewed_movies():
-                    return await self.data.get_user_reviewed_movies(user_id)
+            try:
+                self.connection.rollback()
+            except:
+                pass
 
-                loop_fallback = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop_fallback)
-                watched_entries = loop_fallback.run_until_complete(get_reviewed_movies())
-                loop_fallback.close()
+            with self.connection.cursor() as cursor:
+                # 1. Поиск в user_watched
+                for variant in user_variants[:5]:
+                    try:
+                        cursor.execute("""
+                            SELECT DISTINCT movie_id, added_date
+                            FROM db.user_watched 
+                            WHERE user_url = %s
+                        """, (variant,))
 
-                logger.info(f"Для {user_id} user_watched пуст, загружено {len(watched_entries)} фильмов из reviews")
+                        for row in cursor.fetchall():
+                            movie_id = row[0] if row[0] else None
+                            if movie_id:
+                                watched_entries.append({
+                                    'movie_id': movie_id,
+                                    'added_date': row[1] if len(row) > 1 else None,
+                                    'source': 'user_watched',
+                                    'rating': None,
+                                    'review_text': '',
+                                    'date': None,
+                                    'title': '',
+                                    'title_ru': '',
+                                    'year': '',
+                                    'genre': ''
+                                })
+                                logger.debug(f"Найден фильм {movie_id} в user_watched")
+                    except Exception as e:
+                        pass
+
+                # 2. Поиск в reviews (основной источник)
+                for variant in user_variants:
+                    try:
+                        cursor.execute("""
+                            SELECT DISTINCT 
+                                r.movie_review_url,
+                                r.rating,
+                                r.review_text,
+                                r.date,
+                                m.title,
+                                m.title_ru,
+                                m.year,
+                                m.genre
+                            FROM db.reviews r
+                            LEFT JOIN db.movies m ON m.movie_url = r.movie_review_url
+                            WHERE r.user_url = %s
+                              AND r.rating IS NOT NULL 
+                              AND r.rating != ''
+                            ORDER BY r.date DESC
+                            LIMIT 1000
+                        """, (variant,))
+
+                        for row in cursor.fetchall():
+                            movie_review_url = row[0] if row[0] else ''
+                            if not movie_review_url:
+                                continue
+
+                            match = re.search(r'(tt\d+)', movie_review_url)
+                            if match:
+                                movie_id = match.group(1)
+
+                                rating_value = None
+                                rating_raw = row[1] if len(row) > 1 else None
+                                if rating_raw:
+                                    try:
+                                        rating_str = str(rating_raw).strip()
+                                        if '/' in rating_str:
+                                            rating_str = rating_str.split('/')[0].strip()
+                                        rating_value = float(rating_str)
+                                    except:
+                                        rating_value = None
+
+                                watched_entries.append({
+                                    'movie_id': movie_id,
+                                    'rating': rating_value,
+                                    'review_text': row[2] if len(row) > 2 and row[2] else '',
+                                    'date': row[3] if len(row) > 3 else None,
+                                    'title': row[4] if len(row) > 4 and row[4] else '',
+                                    'title_ru': row[5] if len(row) > 5 and row[5] else '',
+                                    'year': row[6] if len(row) > 6 else '',
+                                    'genre': row[7] if len(row) > 7 and row[7] else '',
+                                    'source': 'reviews',
+                                    'added_date': None
+                                })
+                                logger.debug(f"Найден фильм {movie_id} в reviews")
+                    except Exception as e:
+                        logger.debug(f"Ошибка поиска по варианту {variant}: {e}")
+
+                # 3. Поиск в reviews через LIKE (для форматов с параметрами)
+                try:
+                    cursor.execute("""
+                        SELECT DISTINCT 
+                            r.movie_review_url,
+                            r.rating,
+                            r.review_text,
+                            r.date,
+                            m.title,
+                            m.title_ru,
+                            m.year,
+                            m.genre
+                        FROM db.reviews r
+                        LEFT JOIN db.movies m ON m.movie_url = r.movie_review_url
+                        WHERE r.user_url LIKE %s
+                          AND r.rating IS NOT NULL 
+                          AND r.rating != ''
+                        ORDER BY r.date DESC
+                        LIMIT 1000
+                    """, (f'%{user_login}%',))
+
+                    for row in cursor.fetchall():
+                        movie_review_url = row[0] if row[0] else ''
+                        if not movie_review_url:
+                            continue
+
+                        match = re.search(r'(tt\d+)', movie_review_url)
+                        if match:
+                            movie_id = match.group(1)
+
+                            # Проверяем, нет ли уже такого фильма
+                            if not any(e.get('movie_id') == movie_id for e in watched_entries):
+                                rating_value = None
+                                rating_raw = row[1] if len(row) > 1 else None
+                                if rating_raw:
+                                    try:
+                                        rating_str = str(rating_raw).strip()
+                                        if '/' in rating_str:
+                                            rating_str = rating_str.split('/')[0].strip()
+                                        rating_value = float(rating_str)
+                                    except:
+                                        rating_value = None
+
+                                watched_entries.append({
+                                    'movie_id': movie_id,
+                                    'rating': rating_value,
+                                    'review_text': row[2] if len(row) > 2 and row[2] else '',
+                                    'date': row[3] if len(row) > 3 else None,
+                                    'title': row[4] if len(row) > 4 and row[4] else '',
+                                    'title_ru': row[5] if len(row) > 5 and row[5] else '',
+                                    'year': row[6] if len(row) > 6 else '',
+                                    'genre': row[7] if len(row) > 7 and row[7] else '',
+                                    'source': 'reviews_like',
+                                    'added_date': None
+                                })
+                except Exception as e:
+                    logger.debug(f"Ошибка LIKE поиска: {e}")
+
+                # Дедупликация по movie_id
+                unique_movies = {}
+                for entry in watched_entries:
+                    movie_id = entry.get('movie_id')
+                    if movie_id and movie_id not in unique_movies:
+                        unique_movies[movie_id] = entry
+                    elif movie_id and unique_movies[movie_id].get('rating') is None and entry.get('rating') is not None:
+                        unique_movies[movie_id] = entry
+
+                watched_entries = list(unique_movies.values())
+                logger.info(f"Загружено {len(watched_entries)} уникальных фильмов для {user_login}")
 
             # Обогащаем данными о фильмах
             watched = []
-            for watched_item in watched_entries:
-                movie_id = watched_item.get('movie_id')
+            movies_not_found = []
+            movies_without_details = []
+
+            for item in watched_entries:
+                movie_id = item.get('movie_id')
                 if not movie_id:
                     continue
 
-                details = recommender.get_movie_details(movie_id) if recommender else None
+                # Пытаемся получить детали фильма
+                details = self._get_movie_details_simple(movie_id)
+
                 if not details:
-                    # Для фильмов, которых нет в локальном каталоге, возвращаем базовую карточку.
-                    fallback_title = watched_item.get('title_ru') or watched_item.get('title') or f"Фильм {movie_id}"
+                    # Создаем базовые детали из имеющихся данных
+                    title = item.get('title', '')
+                    title_ru = item.get('title_ru', '')
+                    year = str(item.get('year', '')) if item.get('year') else ''
+                    genre = item.get('genre', '')
+
+                    # Если нет названия, пробуем получить из movies_df через другой запрос
+                    if not title and self.movies_df is not None:
+                        movie_row = self.movies_df[self.movies_df['movie_id'] == movie_id]
+                        if len(movie_row) > 0:
+                            title = movie_row.iloc[0].get('title', '')
+                            title_ru = movie_row.iloc[0].get('title_ru', '')
+                            year = str(movie_row.iloc[0].get('year', ''))
+                            genre = movie_row.iloc[0].get('genre', '')
+
                     details = {
                         'movie_id': movie_id,
-                        'title': fallback_title,
-                        'title_ru': watched_item.get('title_ru') or watched_item.get('title') or fallback_title,
-                        'year': watched_item.get('year') or '',
-                        'genre': '',
-                        'genres': [],
+                        'title': title if title else f"Фильм {movie_id}",
+                        'title_ru': title_ru if title_ru else (title if title else f"Фильм {movie_id}"),
+                        'year': year,
+                        'genre': genre,
+                        'genres': [g.strip() for g in genre.split(',') if g.strip()],
                         'imdb_rating': None,
                         'plot': '',
                         'plot_ru': '',
@@ -615,35 +1180,146 @@ class DataProvider:
                         'actors_ru': []
                     }
 
-                rating_data = {
-                    'rating': watched_item.get('rating'),
-                    'review_text': watched_item.get('review_text'),
-                    'date': watched_item.get('date')
-                }
+                    if not title:
+                        movies_without_details.append(movie_id)
 
-                # Если у записи из user_watched нет оценки, достаём из reviews.
-                if rating_data['rating'] is None and not rating_data['review_text'] and not rating_data['date']:
-                    async def get_rating():
-                        return await self.data.get_user_rating(user_id, movie_id)
+                # Добавляем пользовательскую информацию
+                rating = item.get('rating')
+                if rating is not None:
+                    try:
+                        details['user_rating'] = float(rating)
+                        details['rating'] = float(rating)
+                    except:
+                        details['user_rating'] = None
+                        details['rating'] = None
+                else:
+                    details['user_rating'] = None
+                    details['rating'] = None
 
-                    loop2 = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop2)
-                    rating_data = loop2.run_until_complete(get_rating())
-                    loop2.close()
-
-                if rating_data:
-                    details['rating'] = rating_data.get('rating')
-                    details['user_rating'] = rating_data.get('rating')
-                    details['review_text'] = rating_data.get('review_text', '')
-                    details['review_date'] = rating_data.get('date', '')
+                details['review_text'] = item.get('review_text', '')
+                details['review_date'] = str(item.get('date', '')) if item.get('date') else ''
+                details['added_date'] = str(item.get('added_date', '')) if item.get('added_date') else ''
 
                 watched.append(details)
+
+            if movies_without_details:
+                logger.warning(f"Фильмы без деталей: {len(movies_without_details)} из {len(watched_entries)}")
+                logger.debug(f"Примеры ID без деталей: {movies_without_details[:10]}")
+
+            logger.info(
+                f"Итоговое количество фильмов для отображения: {len(watched)} (загружено уникальных: {len(watched_entries)})")
 
             return watched
 
         except Exception as e:
             logger.error(f"Ошибка получения просмотренных фильмов: {e}")
+            import traceback
+            traceback.print_exc()
             return []
+
+    def _get_movie_details_simple(self, movie_id: str) -> Optional[Dict]:
+        """Простое получение деталей фильма без зависимостей"""
+        try:
+            if self.movies_df is None:
+                return None
+
+            # Поиск фильма по movie_id (как есть)
+            movie = self.movies_df[self.movies_df['movie_id'] == movie_id]
+
+            # Если не нашли, пробуем поискать с преобразованием в строку
+            if len(movie) == 0:
+                movie = self.movies_df[self.movies_df['movie_id'].astype(str) == str(movie_id)]
+
+            if len(movie) == 0:
+                # Пробуем поискать по частичному совпадению
+                movie = self.movies_df[self.movies_df['movie_id'].astype(str).str.contains(str(movie_id), na=False)]
+
+            if len(movie) == 0:
+                return None
+
+            movie = movie.iloc[0]
+
+            def safe_str(key, default=''):
+                val = movie.get(key)
+                if val is None or pd.isna(val):
+                    return default
+                if isinstance(val, (list, tuple, np.ndarray)):
+                    if len(val) > 0:
+                        return ', '.join(str(v) for v in val if v and str(v) != 'nan')
+                    return default
+                val_str = str(val)
+                if val_str == 'nan' or val_str == 'None' or val_str == '':
+                    return default
+                return val_str
+
+            def safe_float(key, default=None):
+                val = movie.get(key)
+                if val is None or pd.isna(val):
+                    return default
+                try:
+                    return float(val)
+                except:
+                    return default
+
+            return {
+                'movie_id': str(movie_id),
+                'title': safe_str('title', ''),
+                'title_ru': safe_str('title_ru', safe_str('title', '')),
+                'year': safe_str('year', ''),
+                'genre': safe_str('genre', ''),
+                'imdb_rating': safe_float('imdb'),
+                'plot': safe_str('plot', ''),
+                'plot_ru': safe_str('description_ru', safe_str('plot', '')),
+                'directors': [d.strip() for d in safe_str('directors', '').split(',') if
+                              d.strip() and d.strip() != 'nan'],
+                'directors_ru': [d.strip() for d in safe_str('directors_ru', '').split(',') if
+                                 d.strip() and d.strip() != 'nan'],
+                'actors': [a.strip() for a in safe_str('actors', '').split(',') if a.strip() and a.strip() != 'nan'],
+                'actors_ru': [a.strip() for a in safe_str('actors_ru', '').split(',') if
+                              a.strip() and a.strip() != 'nan']
+            }
+        except Exception as e:
+            logger.error(f"Ошибка получения деталей фильма {movie_id}: {e}")
+            return None
+
+    def _get_movie_details_from_cache(self, movie_id: str) -> Dict:
+        """Получение деталей фильма из локального кэша"""
+        if self.movies_df is None:
+            return None
+
+        movie = self.movies_df[self.movies_df['movie_id'] == movie_id]
+        if len(movie) == 0:
+            return None
+
+        movie = movie.iloc[0]
+
+        # Безопасное получение значений
+        def safe_get(col_name, default=''):
+            if col_name in movie.index:
+                val = movie[col_name]
+                if val is not None:
+                    if isinstance(val, (list, tuple, np.ndarray)):
+                        if len(val) > 0:
+                            return ', '.join(str(v) for v in val if v)
+                        return default
+                    elif pd.notna(val):
+                        return val
+            return default
+
+        return {
+            'movie_id': str(movie_id),
+            'title': str(safe_get('title', '')),
+            'title_ru': str(safe_get('title_ru', safe_get('title', ''))),
+            'year': str(safe_get('year', '')),
+            'genre': str(safe_get('genre', '')),
+            'imdb_rating': safe_get('imdb', None),
+            'plot': str(safe_get('plot', '')),
+            'plot_ru': str(safe_get('description_ru', safe_get('plot', ''))),
+            'directors': safe_get('directors', '').split(',') if safe_get('directors', '') else [],
+            'directors_ru': safe_get('directors_ru', '').split(',') if safe_get('directors_ru', '') else [],
+            'actors': safe_get('actors', '').split(',') if safe_get('actors', '') else [],
+            'actors_ru': safe_get('actors_ru', '').split(',') if safe_get('actors_ru', '') else []
+        }
 
 
 # Инициализация глобальных объектов
@@ -657,7 +1333,7 @@ _initialized = False
 
 def init_online_components():
     """Инициализация онлайн-компонентов"""
-    global models_provider, data_provider, context_handler, candidate_generator, ranker, postprocessor, loop, _initialized
+    global models_provider, data_provider, context_handler, candidate_generator, ranker, postprocessor, loop, _initialized, incremental_updater, online_updater
 
     if _initialized:
         return
@@ -666,6 +1342,8 @@ def init_online_components():
 
     models_provider = ModelsProvider(model_trainer, data_pipeline)
     data_provider = DataProvider(data_pipeline)
+    incremental_updater = IncrementalUpdater(models_provider, data_provider, cache_manager)
+    online_updater = OnlineDataUpdater(data_pipeline, models_provider)
 
     context_handler = ContextHandler(data_provider)
     candidate_generator = CandidateGenerator(models_provider, data_provider, {
@@ -790,80 +1468,154 @@ def setup_app():
     # Создаем директорию для моделей
     os.makedirs(config.offline.models_path, exist_ok=True)
 
-    # Функция для асинхронной проверки и обучения
-    async def check_and_train():
-        global models_provider, data_provider, recommender, reviews_df
+    # Проверяем, есть ли уже обученные модели
+    model_files_exist = check_models_exist(config.offline.models_path)
 
-        # 1. Загружаем данные для проверки
-        logger.info("Загрузка данных для проверки...")
-        if not await data_pipeline.load_data():
-            logger.error("Не удалось загрузить данные")
+    if model_files_exist:
+        logger.info("Модели уже существуют, загружаем без переобучения")
+        # Только загружаем существующие модели
+        if model_trainer.load_models():
+            models_provider = ModelsProvider(model_trainer, data_pipeline)
+            data_provider = DataProvider(data_pipeline)
+            init_online_components()
+            logger.info("Модели успешно загружены")
+            return
+        else:
+            logger.warning("Не удалось загрузить модели, потребуется переобучение")
+
+    # Если моделей нет или загрузить не удалось, запускаем обучение в фоне
+    logger.info("Запуск обучения моделей в фоновом режиме...")
+
+    # Запускаем обучение в отдельном потоке, чтобы не блокировать запуск сервера
+    import threading
+    training_thread = threading.Thread(target=run_offline_pipeline_background, daemon=True)
+    training_thread.start()
+
+    # Инициализируем базовые компоненты без моделей
+    init_online_components_fallback()
+
+    logger.info("Приложение запущено, модели обучаются в фоне")
+
+
+def check_models_exist(models_path: str) -> bool:
+    """Проверяет наличие основных файлов моделей"""
+    required_files = [
+        'svd_model.pkl',
+        'movies_df.pkl',
+        'user_main_df.pkl'
+    ]
+
+    for file in required_files:
+        if not os.path.exists(os.path.join(models_path, file)):
+            logger.info(f"Файл {file} отсутствует")
             return False
 
-        data_pipeline.preprocess_data()
+    logger.info("Основные файлы моделей найдены")
+    return True
 
-        # 2. Создаем снапшот данных
-        data_snapshot = model_trainer.versioning.get_data_snapshot(data_pipeline)
-        logger.info(f"Снапшот данных: {list(data_snapshot.keys())}")
 
-        # 3. Проверяем, нужно ли переобучение
-        need_training = not model_trainer.load_models(data_snapshot)
-
-        if need_training:
-            logger.info("Требуется переобучение моделей")
-
-            # Полный пайплайн
-            data = await data_pipeline.run_pipeline()
-            data_pipeline.save_data(data)
-
-            # Обучение моделей
-            await model_trainer.train_all_models(data)
-
-            # Сохраняем модели со снапшотом данных
-            model_trainer.save_models(data_snapshot)
-
-            logger.info("Модели успешно переобучены")
-        else:
-            logger.info("Модели актуальны, переобучение не требуется")
-            # Просто загружаем данные для онлайн-компонентов
-            data = await data_pipeline.run_pipeline()
-
-        # 4. Обновляем глобальные переменные
-        # Загружаем reviews_df для совместимости
-        reviews_path = os.path.join(model_trainer.models_path, 'reviews_df.pkl')
-        if os.path.exists(reviews_path):
-            reviews_df = pd.read_pickle(reviews_path)
-            logger.info(f"Загружено {len(reviews_df)} ревью")
-        else:
-            reviews_df = None
-
-        return True
-
-    # Запускаем проверку в отдельном цикле событий
-    init_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(init_loop)
-
+def run_offline_pipeline_background():
+    """Запуск обучения в фоновом режиме"""
     try:
-        success = init_loop.run_until_complete(check_and_train())
-        if not success:
-            logger.error("Не удалось настроить приложение")
-    except Exception as e:
-        logger.error(f"Ошибка при настройке: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        init_loop.close()
+        logger.info("Фоновое обучение моделей начато...")
 
-    # Инициализируем провайдеров и онлайн-компоненты
-    if model_trainer.load_models():
+        # Создаем новый event loop для фонового потока
+        background_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(background_loop)
+
+        async def train():
+            # Загрузка данных
+            await data_pipeline.load_data()
+            data_pipeline.preprocess_data()
+            data_pipeline.create_feature_vectors()
+
+            # Создание user-item матрицы
+            user_item_matrix = data_pipeline.create_user_item_matrix()
+            popularity_scores = data_pipeline.compute_popularity_scores()
+            recency_scores = data_pipeline.compute_recency_scores()
+
+            # Обучение SVD (быстрая модель)
+            await model_trainer.build_svd_model(user_item_matrix)
+
+            # Сохранение моделей
+            model_trainer.save_models()
+
+            logger.info("Фоновое обучение завершено")
+
+        background_loop.run_until_complete(train())
+        background_loop.close()
+
+        # После обучения обновляем компоненты
+        global models_provider, data_provider
         models_provider = ModelsProvider(model_trainer, data_pipeline)
         data_provider = DataProvider(data_pipeline)
-        init_online_components()
-    else:
-        logger.error("Не удалось загрузить модели")
 
-    logger.info("Приложение настроено")
+    except Exception as e:
+        logger.error(f"Ошибка фонового обучения: {e}")
+        import traceback
+        traceback.print_exc()
 
+
+def init_online_components_fallback():
+    """Инициализация онлайн-компонентов без полноценных моделей (fallback режим)"""
+    global models_provider, data_provider, context_handler, candidate_generator, ranker, postprocessor, loop, _initialized
+
+    logger.info("Инициализация онлайн-компонентов в fallback режиме...")
+
+    # Создаем заглушку для моделей
+    if models_provider is None:
+        models_provider = ModelsProviderFallback()
+
+    if data_provider is None:
+        data_provider = DataProviderFallback()
+
+    context_handler = ContextHandler(data_provider)
+    candidate_generator = CandidateGenerator(models_provider, data_provider, {
+        'weights': config.online.weights,
+        'candidate_limit': config.online.candidate_limit
+    })
+    ranker = Ranker(models_provider, data_provider, {
+        'final_top_n': config.online.final_top_n
+    })
+    postprocessor = Postprocessor(data_provider)
+
+    _initialized = True
+    logger.info("Онлайн-компоненты в fallback режиме инициализированы")
+
+
+class ModelsProviderFallback:
+    """Заглушка для ModelsProvider, когда модели еще не обучены"""
+
+    def __init__(self):
+        self.movies_df = None
+        self.genres_df = None
+        logger.info("ModelsProviderFallback инициализирован")
+
+    def get_similar_movies(self, movie_id, n=20):
+        return []
+
+    def get_svd_recommendations(self, user_id, n=50):
+        return []
+
+    def get_als_recommendations(self, user_id, n=50):
+        return []
+
+    def predict_rating(self, user_id, movie_id):
+        return 0.5
+
+
+class DataProviderFallback:
+    """Заглушка для DataProvider"""
+
+    def __init__(self):
+        self.movies_df = None
+        logger.info("DataProviderFallback инициализирован")
+
+    def get_user_watched_movies(self, user_id):
+        return []
+
+    def get_popular_movies(self, limit=100):
+        return []
 
 # Вызываем инициализацию при старте
 setup_app()
@@ -876,8 +1628,13 @@ def get_recommendations_api():
     """API для получения рекомендаций"""
     global loop
 
-    data = request.json
-    user_id = data.get('user_url') or session.get('user_url')
+    data = request.json or {}
+
+    # Безопасное получение user_id
+    user_id = data.get('user_url')
+    if not user_id:
+        from flask import session as flask_session
+        user_id = flask_session.get('user_url')
 
     if not user_id:
         return jsonify({'error': 'Пользователь не авторизован'}), 401
@@ -896,45 +1653,62 @@ def get_recommendations_api():
     logger.info(f"Получение рекомендаций для пользователя: {normalized_user_id}")
 
     try:
+        # Убеждаемся, что компоненты инициализированы
         if not _initialized:
             init_online_components()
 
-        if loop is None or loop.is_closed():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        # Получаем историю пользователя
-        user_rated_movies = data_provider.get_user_watched_movies(normalized_user_id) if data_provider else []
-        logger.info(f"Пользователь {normalized_user_id} оценил {len(user_rated_movies)} фильмов")
+        # ВАЖНО: Принудительно загружаем историю пользователя и инвалидируем кэш при первом запросе
+        # Получаем историю пользователя (синхронно)
+        user_rated_movies = []
+        if data_provider:
+            user_rated_movies = data_provider.get_user_watched_movies(normalized_user_id)
+            logger.info(f"Пользователь {normalized_user_id} оценил {len(user_rated_movies)} фильмов")
 
         # Получаем жанровые предпочтения
         genre_prefs = {}
         if context_handler:
+            # Принудительно обновляем историю в контексте
+            context_handler.clear_session_cache(normalized_user_id)
             genre_prefs = context_handler.get_user_genre_preferences(normalized_user_id)
-            logger.info(f"Жанровые предпочтения: {genre_prefs}")
 
-        # ВАЖНО: Инвалидируем кэш, если у пользователя появились новые оценки
-        # Это заставит систему пересчитать рекомендации
-        if user_rated_movies:
-            # Проверяем, есть ли кэш и нужно ли его инвалидировать
-            cached = cache_manager.get_cached_top_n(normalized_user_id)
-            if cached:
-                # Проверяем, соответствует ли кэш текущим предпочтениям
-                # Для простоты - инвалидируем, если есть жанровые предпочтения
-                if genre_prefs:
-                    cache_manager.invalidate_user_cache(normalized_user_id)
-                    logger.info(f"Кэш инвалидирован для {normalized_user_id} для персонализации")
+        logger.info(f"Жанровые предпочтения: {genre_prefs}")
+
+        # Если есть оценки, но нет жанровых предпочтений - пересчитываем
+        if len(user_rated_movies) > 0 and not genre_prefs:
+            logger.info("Пересчет жанровых предпочтений...")
+            # Принудительно пересчитываем предпочтения
+            if context_handler:
+                genre_prefs = context_handler.get_user_genre_preferences(normalized_user_id)
+                # Сохраняем в кэш
+                if user_id not in context_handler.session_cache:
+                    context_handler.session_cache[user_id] = {}
+                context_handler.session_cache[user_id]['genre_preferences'] = genre_prefs
+
+        # Инвалидируем кэш если есть оценки, но рекомендации не персонализированы
+        force_refresh = len(user_rated_movies) > 0
+
+        # Если есть жанровые предпочтения - обязательно обновляем
+        if genre_prefs:
+            force_refresh = True
+            # Инвалидируем старый кэш
+            cache_manager.invalidate_user_cache(normalized_user_id)
+            logger.info(f"Кэш инвалидирован для персонализации пользователя {normalized_user_id}")
 
         # Получаем рекомендации
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
         recommendations = loop.run_until_complete(
             get_recommendations_for_user(normalized_user_id, {
                 'user_rated_count': len(user_rated_movies),
                 'genre_preferences': genre_prefs,
-                'force_refresh': True  # Флаг для принудительного обновления
+                'force_refresh': force_refresh,
+                'user_rated_movies': {m.get('movie_id') for m in user_rated_movies if m.get('movie_id')}
             })
         )
 
-        # Обогащаем рекомендации данными
+        # Обогащаем рекомендации
         enriched = []
         for rec in recommendations[:top_n]:
             movie_id = rec.get('movie_id')
@@ -944,27 +1718,30 @@ def get_recommendations_api():
                     details['score'] = rec.get('final_score', rec.get('score', 0))
                     details['poster'] = get_poster_filename(details.get('title', ''), details.get('year', ''))
 
-                    # Конвертируем жанры в русские
-                    genres_ru = []
-                    genre_val = details.get('genre', '')
-                    if genre_val and pd.notna(genre_val) and not isinstance(genre_val, (list, np.ndarray)):
-                        genres_en = [g.strip() for g in str(genre_val).split(',') if g.strip()]
-                        for genre_en in genres_en:
-                            genre_ru = genre_en
-                            if models_provider and models_provider.genres_df is not None:
-                                if 'title_ru' in models_provider.genres_df.columns:
-                                    match = models_provider.genres_df[models_provider.genres_df['title'] == genre_en]
-                                    if len(match) > 0:
-                                        genre_ru = match.iloc[0]['title_ru']
-                            genres_ru.append(genre_ru)
-                    details['genres'] = genres_ru
+                    # Просто используем уже готовые жанры
+                    if 'genres' not in details or not details['genres']:
+                        # Fallback: если нет русских жанров, пробуем сконвертировать
+                        genre_val = details.get('genre', '')
+                        if genre_val and pd.notna(genre_val):
+                            genres_ru = []
+                            genres_en = [g.strip() for g in str(genre_val).split(',') if g.strip()]
+                            for genre_en in genres_en:
+                                genre_ru = genre_en
+                                if models_provider and models_provider.genres_df is not None:
+                                    if 'title_ru' in models_provider.genres_df.columns:
+                                        match = models_provider.genres_df[
+                                            models_provider.genres_df['title'] == genre_en]
+                                        if len(match) > 0:
+                                            genre_ru = match.iloc[0]['title_ru']
+                                genres_ru.append(genre_ru)
+                            details['genres'] = genres_ru
+                        else:
+                            details['genres'] = []
 
-                    # Добавляем информацию, почему рекомендован
                     details['recommendation_reason'] = _get_recommendation_reason(details, genre_prefs)
-
                     enriched.append(details)
 
-        logger.info(f"Возвращено {len(enriched)} персонализированных рекомендаций для пользователя {normalized_user_id}")
+        logger.info(f"Возвращено {len(enriched)} персонализированных рекомендаций")
         return jsonify({'recommendations': enriched})
 
     except Exception as e:
@@ -972,6 +1749,70 @@ def get_recommendations_api():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/<path:user_url>/refresh', methods=['POST'])
+def refresh_user_recommendations(user_url):
+    """Принудительное обновление рекомендаций пользователя"""
+    user_url = unquote(user_url)
+
+    def normalize_url(url):
+        url = str(url).strip()
+        url = url.replace('https://www.imdb.com', '')
+        url = url.replace('http://www.imdb.com', '')
+        url = url.rstrip('/')
+        url = url.split('?')[0]
+        return url
+
+    normalized_user_id = normalize_url(user_url)
+
+    # Инвалидируем кэш
+    cache_manager.invalidate_user_cache(normalized_user_id)
+
+    # Очищаем сессионный кэш контекста
+    if context_handler:
+        context_handler.clear_session_cache(normalized_user_id)
+
+    logger.info(f"Рекомендации для {normalized_user_id} будут пересчитаны")
+
+    return jsonify({
+        'success': True,
+        'message': 'Кэш очищен, рекомендации будут пересчитаны при следующем запросе'
+    })
+
+
+@app.route('/api/user/<path:user_url>/session', methods=['GET'])
+def get_user_session(user_url):
+    """Получение информации о сессионных предпочтениях пользователя"""
+    user_url = unquote(user_url)
+
+    def normalize_url(url):
+        url = str(url).strip()
+        url = url.replace('https://www.imdb.com', '')
+        url = url.replace('http://www.imdb.com', '')
+        url = url.rstrip('/')
+        url = url.split('?')[0]
+        return url
+
+    normalized_user_id = normalize_url(user_url)
+
+    if incremental_updater and normalized_user_id in incremental_updater.session_preferences:
+        session = incremental_updater.session_preferences[normalized_user_id]
+        return jsonify({
+            'has_recent_ratings': len(session.get('recent_ratings', [])) > 0,
+            'recent_ratings_count': len(session.get('recent_ratings', [])),
+            'recent_favorites_count': len(session.get('recent_favorites', set())),
+            'genre_preferences': incremental_updater.get_user_genre_preferences(normalized_user_id),
+            'last_update': session.get('last_update').isoformat() if session.get('last_update') else None
+        })
+    else:
+        return jsonify({
+            'has_recent_ratings': False,
+            'recent_ratings_count': 0,
+            'recent_favorites_count': 0,
+            'genre_preferences': {},
+            'message': 'Нет сессионных данных для этого пользователя'
+        })
 
 
 def _get_recommendation_reason(movie_details: dict, user_genre_prefs: dict) -> str:
@@ -2257,7 +3098,7 @@ def create_user():
 
 @app.route('/api/movie/<movie_id>/rate', methods=['POST'])
 def rate_movie(movie_id):
-    """Оценка фильма пользователем (PostgreSQL)"""
+    """Оценка фильма пользователем с немедленным обновлением рекомендаций"""
     try:
         data = request.json
         user_id = data.get('user_id') or session.get('user_url')
@@ -2277,7 +3118,6 @@ def rate_movie(movie_id):
         except ValueError:
             return jsonify({'error': 'Неверный формат оценки'}), 400
 
-        # Нормализуем user_id
         def normalize_url(url):
             url = str(url).strip()
             url = url.replace('https://www.imdb.com', '')
@@ -2291,38 +3131,76 @@ def rate_movie(movie_id):
 
         normalized_user_id = normalize_url(user_id)
 
-        # Сохраняем оценку через data_pipeline
+        # Асинхронное сохранение в БД
         async def save_rating():
             return await data_pipeline.save_user_rating(
                 normalized_user_id, movie_id, rating, review_text
             )
 
+        # Используем новый event loop для каждой операции
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        success = loop.run_until_complete(save_rating())
-        loop.close()
+        try:
+            success = loop.run_until_complete(save_rating())
+        finally:
+            loop.close()
 
         if success:
-            # Инвалидируем кэш пользователя
+            # 1. Обновляем сессионные предпочтения (синхронно)
+            if incremental_updater:
+                incremental_updater.process_user_action(
+                    normalized_user_id,
+                    'rating',
+                    movie_id,
+                    {'rating': rating}
+                )
+
+            # 2. Обновляем контекст пользователя (синхронно)
+            if context_handler:
+                context_handler.update_user_preference(
+                    normalized_user_id, 'rating', movie_id, rating
+                )
+
+            # 3. Инвалидируем кэш
             cache_manager.invalidate_user_cache(normalized_user_id)
 
-            # Логируем обратную связь
+            # 4. Обновляем онлайн-данные в отдельном потоке (не блокируем)
+            def update_online_data():
+                """Запускаем обновление в отдельном event loop"""
+                try:
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    new_loop.run_until_complete(
+                        online_updater.add_user_rating_online(
+                            normalized_user_id, movie_id, rating, review_text
+                        )
+                    )
+                    new_loop.close()
+                except Exception as e:
+                    logger.warning(f"Фоновое обновление не удалось: {e}")
+
+            # Запускаем в отдельном потоке, чтобы не блокировать ответ
+            import threading
+            threading.Thread(target=update_online_data, daemon=True).start()
+
+            # 5. Логируем обратную связь (синхронно в отдельном loop)
             if feedback_logger:
                 try:
-                    feedback_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(feedback_loop)
-                    feedback_loop.run_until_complete(
+                    fb_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(fb_loop)
+                    fb_loop.run_until_complete(
                         feedback_logger.log_rating(normalized_user_id, movie_id, rating)
                     )
-                    feedback_loop.close()
+                    fb_loop.close()
                 except Exception as feedback_error:
                     logger.warning(f"Не удалось записать feedback log: {feedback_error}")
 
-            logger.info(f"Пользователь {normalized_user_id} оценил фильм {movie_id} на {rating}")
+            logger.info(
+                f"Пользователь {normalized_user_id} оценил фильм {movie_id} на {rating} - рекомендации обновлены")
 
             return jsonify({
                 'success': True,
-                'message': 'Оценка сохранена'
+                'message': 'Оценка сохранена, рекомендации обновлены'
             })
         else:
             return jsonify({'error': 'Не удалось сохранить оценку'}), 500
@@ -2357,12 +3235,24 @@ def add_to_watched(movie_id):
         async def add_watched():
             return await data_pipeline.add_to_watched(normalized_user_id, movie_id)
 
+        # Создаем новый event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        success = loop.run_until_complete(add_watched())
-        loop.close()
+        try:
+            success = loop.run_until_complete(add_watched())
+        finally:
+            loop.close()
 
         if success:
+            # Обновляем сессионные предпочтения
+            if incremental_updater:
+                incremental_updater.process_user_action(
+                    normalized_user_id, 'watched', movie_id
+                )
+
+            # Инвалидируем кэш
+            cache_manager.invalidate_user_cache(normalized_user_id)
+
             logger.info(f"Фильм {movie_id} добавлен в просмотренные пользователем {normalized_user_id}")
             return jsonify({'success': True, 'message': 'Фильм добавлен в просмотренные'})
         else:
@@ -2399,12 +3289,26 @@ def toggle_favorite(movie_id):
             else:
                 return await data_pipeline.remove_from_favorites(normalized_user_id, movie_id)
 
+        # Создаем новый event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        success = loop.run_until_complete(toggle())
-        loop.close()
+        try:
+            success = loop.run_until_complete(toggle())
+        finally:
+            loop.close()
 
         if success:
+            action_type = 'favorite' if request.method == 'POST' else 'unfavorite'
+
+            # Обновляем сессионные предпочтения
+            if incremental_updater:
+                incremental_updater.process_user_action(
+                    normalized_user_id, action_type, movie_id
+                )
+
+            # Инвалидируем кэш
+            cache_manager.invalidate_user_cache(normalized_user_id)
+
             action = "добавлен в" if request.method == 'POST' else "удален из"
             logger.info(f"Фильм {movie_id} {action} избранного пользователем {normalized_user_id}")
 

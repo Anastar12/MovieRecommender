@@ -2,6 +2,17 @@
 let movieModal = null;
 let currentMovieId = null;
 
+// После успешного входа пользователя
+async function onUserLogin(userUrl) {
+    // Очищаем кэш рекомендаций
+    await fetch(`/api/user/${encodeURIComponent(userUrl)}/refresh`, {
+        method: 'POST'
+    });
+
+    // Загружаем свежие рекомендации
+    await loadRecommendations(true); // force refresh
+}
+
 // Ждем полной загрузки DOM
 document.addEventListener('DOMContentLoaded', function() {
     console.log('DOM загружен');

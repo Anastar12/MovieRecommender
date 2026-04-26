@@ -2,11 +2,13 @@ import hashlib
 import numpy as np
 from scipy.sparse import csr_matrix, load_npz, save_npz
 from sklearn.decomposition import TruncatedSVD, NMF
-from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import mean_squared_error
 from sklearn.neighbors import NearestNeighbors
 from implicit.als import AlternatingLeastSquares
 from implicit.nearest_neighbours import bm25_weight
+from sklearn.model_selection import train_test_split
 import pickle
 import logging
 import asyncio
@@ -61,14 +63,15 @@ class ModelTrainer:
         return signature
 
     async def build_svd_model(self, user_item_matrix: csr_matrix, n_components: int = None) -> Dict:
-        """Построение SVD модели"""
+        """Построение SVD модели с увеличенным числом компонент (300)"""
         if user_item_matrix is None:
             return None
 
         logger.info("Построение SVD модели...")
 
-        n_components = n_components or min(100, min(user_item_matrix.shape) - 1)
-        n_components = max(20, n_components)
+        # Увеличиваем число компонент до 300 для лучшего качества
+        n_components = n_components or min(300, min(user_item_matrix.shape) - 1)
+        n_components = max(50, n_components)
 
         self.svd_model = TruncatedSVD(
             n_components=n_components,
@@ -80,14 +83,20 @@ class ModelTrainer:
         self.user_factors = user_item_matrix @ self.item_factors
 
         explained_variance = self.svd_model.explained_variance_ratio_.sum()
+        cumulative_variance = np.cumsum(self.svd_model.explained_variance_ratio_)
 
         logger.info(f"SVD завершена: {n_components} компонент, дисперсия: {explained_variance:.4f}")
+        logger.info(f"  - Для 50 компонент: {cumulative_variance[49]:.4f}")
+        logger.info(f"  - Для 100 компонент: {cumulative_variance[99]:.4f}")
+        logger.info(f"  - Для {n_components} компонент: {explained_variance:.4f}")
 
         return {
             'model': self.svd_model,
             'user_factors': self.user_factors,
             'item_factors': self.item_factors,
-            'explained_variance': explained_variance
+            'explained_variance': explained_variance,
+            'n_components': n_components,
+            'cumulative_variance': cumulative_variance.tolist()
         }
 
     async def build_nmf_model(self, user_item_matrix: csr_matrix, n_components: int = None) -> Optional[Dict]:
@@ -116,7 +125,8 @@ class ModelTrainer:
             'model': self.nmf_model,
             'user_factors': self.user_factors_nmf,
             'item_factors': self.item_factors_nmf,
-            'reconstruction_error': self.nmf_model.reconstruction_err_
+            'reconstruction_error': self.nmf_model.reconstruction_err_,
+            'n_components': n_components
         }
 
     async def build_als_model(self, user_item_matrix: csr_matrix, factors: int = 50) -> Optional[Dict]:
@@ -153,100 +163,160 @@ class ModelTrainer:
                                      item_factors_nmf: np.ndarray = None,
                                      popularity_scores: np.ndarray = None,
                                      recency_scores: np.ndarray = None) -> Optional[Dict]:
-        """Построение модели предсказания оценок"""
+        """Построение модели предсказания оценок с расширенными признаками"""
         if user_item_matrix is None or user_factors is None:
             return None
 
         logger.info("Построение модели предсказания оценок...")
 
-        X_train, y_train = [], []
         rows, cols = user_item_matrix.nonzero()
 
-        # Сэмплирование для ускорения
-        sample_size = min(50000, len(rows))
-        indices = np.random.choice(len(rows), sample_size, replace=False) if len(rows) > sample_size else range(
-            len(rows))
+        # Используем все данные для лучшего качества
+        max_samples = 1000000
+        if len(rows) > max_samples:
+            logger.info(f"Данных много ({len(rows)}), берем выборку из {max_samples} для ускорения")
+            indices = np.random.choice(len(rows), max_samples, replace=False)
+        else:
+            indices = range(len(rows))
 
-        # Проверяем наличие NMF факторов
+        logger.info(f"Обработка {len(indices)} оценок пользователей...")
+
+        X_train, y_train = [], []
         has_nmf = user_factors_nmf is not None and item_factors_nmf is not None
 
+        # Определяем размерности факторов
+        user_factor_dim = min(50, user_factors.shape[1] if len(user_factors.shape) > 1 else user_factors.shape[0])
+        item_factor_dim = min(50, item_factors.shape[1] if len(item_factors.shape) > 1 else item_factors.shape[0])
+
+        processed = 0
         for i in indices:
             user_idx = rows[i]
             movie_idx = cols[i]
             rating = user_item_matrix[user_idx, movie_idx]
 
             if rating > 0:
-                # SVD признаки
-                svd_features = np.concatenate([
-                    user_factors[user_idx][:20],
-                    item_factors[movie_idx][:20]
-                ])
+                user_vec = user_factors[user_idx][:user_factor_dim] if user_factor_dim > 0 else np.array([0.5] * 50)
+                item_vec = item_factors[movie_idx][:item_factor_dim] if item_factor_dim > 0 else np.array([0.5] * 50)
 
-                # NMF признаки
-                if has_nmf:
-                    nmf_features = np.concatenate([
-                        user_factors_nmf[user_idx][:15],
-                        item_factors_nmf[movie_idx][:15]
-                    ])
-                    # Объединяем SVD и NMF
-                    combined_features = np.concatenate([svd_features, nmf_features])
+                # Дополняем до нужной размерности
+                if len(user_vec) < 50:
+                    user_vec = np.pad(user_vec, (0, 50 - len(user_vec)), constant_values=0.5)
+                if len(item_vec) < 50:
+                    item_vec = np.pad(item_vec, (0, 50 - len(item_vec)), constant_values=0.5)
+
+                features = []
+
+                # 1. SVD признаки (100 признаков: 50 пользовательских + 50 фильмовых)
+                features.extend(user_vec[:50])
+                features.extend(item_vec[:50])
+
+                # 2. NMF признаки (60 признаков: 30 + 30)
+                if has_nmf and user_idx < len(user_factors_nmf) and movie_idx < len(item_factors_nmf):
+                    nmf_user_dim = min(30, len(user_factors_nmf[user_idx]))
+                    nmf_item_dim = min(30, len(item_factors_nmf[movie_idx]))
+
+                    nmf_user = user_factors_nmf[user_idx][:nmf_user_dim] if nmf_user_dim > 0 else np.array([0.5] * 30)
+                    nmf_item = item_factors_nmf[movie_idx][:nmf_item_dim] if nmf_item_dim > 0 else np.array([0.5] * 30)
+
+                    if len(nmf_user) < 30:
+                        nmf_user = np.pad(nmf_user, (0, 30 - len(nmf_user)), constant_values=0.5)
+                    if len(nmf_item) < 30:
+                        nmf_item = np.pad(nmf_item, (0, 30 - len(nmf_item)), constant_values=0.5)
+
+                    features.extend(nmf_user[:30])
+                    features.extend(nmf_item[:30])
                 else:
-                    combined_features = svd_features
+                    features.extend([0.5] * 60)
 
-                # Добавляем дополнительные признаки
-                extra_features = []
+                # 3. Статистические признаки (4 признака)
+                user_rating_count = min(1.0, user_item_matrix[user_idx].nnz / 200)
+                movie_rating_count = min(1.0, user_item_matrix[:, movie_idx].nnz / 200)
+
+                features.append(user_rating_count)
+                features.append(movie_rating_count)
+
+                # 4. Популярность и свежесть (2 признака)
                 if popularity_scores is not None and movie_idx < len(popularity_scores):
-                    extra_features.append(popularity_scores[movie_idx])
-                if recency_scores is not None and movie_idx < len(recency_scores):
-                    extra_features.append(recency_scores[movie_idx])
-
-                # Финальный вектор признаков
-                if extra_features:
-                    features = np.concatenate([combined_features, extra_features])
+                    features.append(float(popularity_scores[movie_idx]))
                 else:
-                    features = combined_features
+                    features.append(0.5)
+
+                if recency_scores is not None and movie_idx < len(recency_scores):
+                    features.append(float(recency_scores[movie_idx]))
+                else:
+                    features.append(0.5)
 
                 X_train.append(features)
                 y_train.append(rating)
 
-        if len(X_train) < 100:
+            processed += 1
+            if processed % 50000 == 0:
+                logger.info(f"Обработано {processed}/{len(indices)} оценок...")
+
+        if len(X_train) < 1000:
             logger.warning(f"Недостаточно данных для обучения: {len(X_train)}")
             return None
 
-        X_train = np.array(X_train)
-        y_train = np.array(y_train)
+        X_train = np.array(X_train, dtype=np.float32)
+        y_train = np.array(y_train, dtype=np.float32)
 
-        # Обработка пропусков
+        # Удаляем NaN
         nan_mask = np.isnan(X_train).any(axis=1)
         if nan_mask.any():
             logger.info(f"Удаляем {nan_mask.sum()} строк с NaN")
             X_train = X_train[~nan_mask]
             y_train = y_train[~nan_mask]
 
-        # Если после удаления NaN осталось мало данных
-        if len(X_train) < 100:
-            logger.warning(f"После удаления NaN осталось {len(X_train)} примеров")
-            return None
-
-        self.rating_predictor = HistGradientBoostingRegressor(
-            max_iter=200,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=42,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=10
+        # Разделяем на обучающую и валидационную выборки
+        X_train_split, X_val, y_train_split, y_val = train_test_split(
+            X_train, y_train, test_size=0.2, random_state=42
         )
 
-        self.rating_predictor.fit(X_train, y_train)
-        score = self.rating_predictor.score(X_train, y_train)
+        logger.info(f"Обучающая выборка: {len(X_train_split)}, Валидационная: {len(X_val)}")
+        logger.info(f"Количество признаков: {X_train.shape[1]}")
 
-        logger.info(f"Модель предсказания обучена на {len(X_train)} примерах, R²: {score:.4f}")
+        # Используем GradientBoostingRegressor
+        self.rating_predictor = GradientBoostingRegressor(
+            n_estimators=150,  # Увеличиваем для лучшего качества
+            max_depth=5,
+            learning_rate=0.05,  # Уменьшаем для лучшей обобщающей способности
+            random_state=42,
+            subsample=0.8,
+            verbose=1
+        )
+
+        # Обучаем модель
+        self.rating_predictor.fit(X_train_split, y_train_split)
+
+        # Оценка на обучающей выборке
+        train_score = self.rating_predictor.score(X_train_split, y_train_split)
+        train_pred = self.rating_predictor.predict(X_train_split)
+        train_mse = mean_squared_error(y_train_split, train_pred)
+        train_rmse = np.sqrt(train_mse)
+
+        # Оценка на валидационной выборке
+        val_score = self.rating_predictor.score(X_val, y_val)
+        val_pred = self.rating_predictor.predict(X_val)
+        val_mse = mean_squared_error(y_val, val_pred)
+        val_rmse = np.sqrt(val_mse)
+
+        logger.info(f"Модель предсказания обучена")
+        logger.info(f"  - Обучающий R²: {train_score:.4f}")
+        logger.info(f"  - Обучающий RMSE: {train_rmse:.4f}")
+        logger.info(f"  - Валидационный R²: {val_score:.4f}")
+        logger.info(f"  - Валидационный RMSE: {val_rmse:.4f}")
+        logger.info(f"  - Размер обучающей выборки: {len(X_train_split)}")
+        logger.info(f"  - Количество признаков: {X_train.shape[1]}")
 
         return {
             'model': self.rating_predictor,
-            'train_size': len(X_train),
-            'r2_score': score
+            'train_size': len(X_train_split),
+            'val_size': len(X_val),
+            'train_r2': train_score,
+            'val_r2': val_score,
+            'train_rmse': train_rmse,
+            'val_rmse': val_rmse,
+            'n_features': X_train.shape[1]
         }
 
     async def build_ranking_model(self, user_item_matrix: csr_matrix,

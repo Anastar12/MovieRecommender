@@ -2,9 +2,13 @@ import logging
 import numpy as np
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import sys
+
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
 
 logger = logging.getLogger(__name__)
-
 
 class Ranker:
     """Модуль ранжирования кандидатов"""
@@ -33,10 +37,15 @@ class Ranker:
         user_genres = context.get('user_genre_preferences', {})
         user_ratings = context.get('user_rated_movies', set())
 
-        # Параллельное вычисление оценок
-        for candidate in candidates:
-            scores = await self._compute_scores(candidate, context, user_genres, user_ratings)
-            candidate['final_score'] = self._aggregate_scores(scores, candidate, context)
+        # Отключаем лишний вывод
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+
+            # Параллельное вычисление оценок
+            for candidate in candidates:
+                scores = await self._compute_scores(candidate, context, user_genres, user_ratings)
+                candidate['final_score'] = self._aggregate_scores(scores, candidate, context)
 
         # Сортировка по финальному score
         candidates.sort(key=lambda x: x['final_score'], reverse=True)

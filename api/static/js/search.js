@@ -27,6 +27,9 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 function searchMovies() {
+    const counter = document.getElementById('search-counter');
+    if (counter) counter.textContent = '';
+
     const query = document.getElementById('search-input').value.trim();
     console.log('Поиск:', query);
 
@@ -59,14 +62,26 @@ function searchMovies() {
 
 function displaySearchResults(movies) {
     const container = document.getElementById('search-results');
+    const counter = document.getElementById('search-counter');
 
     if (!movies || movies.length === 0) {
+        if (counter) counter.textContent = '';
         container.innerHTML = '<div class="alert alert-info">Фильмы не найдены</div>';
         return;
     }
 
+    const sortedMovies = [...movies].sort((a, b) => {
+        const ratingA = parseFloat(a.imdb_rating) || 0;
+        const ratingB = parseFloat(b.imdb_rating) || 0;
+        return ratingB - ratingA;
+    });
+
+    if (counter) {
+        counter.textContent = `Найдено ${sortedMovies.length} фильмов`;
+    }
+
     let html = '<div class="row">';
-    movies.forEach(movie => {
+    sortedMovies.forEach(movie => {
         const posterUrl = movie.poster ? `/img/horizontal/${movie.poster}` : '/img/horizontal/placeholder.jpg';
         const displayTitle = movie.title_ru || movie.title || 'Без названия';
 
