@@ -12,6 +12,7 @@ import re
 import pickle
 from datetime import datetime
 import csv
+import traceback
 
 from scipy.sparse import load_npz
 import psycopg2
@@ -19,6 +20,7 @@ from psycopg2.extras import RealDictCursor
 
 from core.config import config
 from offline.data_pipeline import DataPipeline
+from offline.evaluation_metrics import RecommendationMetrics
 from offline.model_trainer import ModelTrainer
 from offline.cache_manager import CacheManager
 from online.incremental_updater import IncrementalUpdater, OnlineDataUpdater
@@ -78,6 +80,45 @@ recommender = None
 reviews_df = None
 
 
+# Диагностика путей
+def check_models_path():
+    """Проверка наличия файлов моделей"""
+    models_path = config.offline.models_path
+    print(f"\n=== ДИАГНОСТИКА МОДЕЛЕЙ ===")
+    print(f"Путь к моделям: {models_path}")
+    print(f"Путь существует: {os.path.exists(models_path)}")
+
+    if os.path.exists(models_path):
+        files = os.listdir(models_path)
+        print(f"Файлов в папке: {len(files)}")
+
+        # Проверяем ключевые файлы
+        key_files = [
+            'rating_predictor.pkl',
+            'user_factors.npy',
+            'item_factors.npy',
+            'movie_indices.pkl',
+            'user_indices.pkl',
+            'movies_df.pkl'
+        ]
+
+        for key_file in key_files:
+            exists = key_file in files
+            if exists:
+                size = os.path.getsize(os.path.join(models_path, key_file)) / 1024 / 1024
+                print(f"  ✓ {key_file} ({size:.2f} MB)")
+            else:
+                print(f"  ✗ {key_file}")
+    else:
+        print(f"❌ Путь {models_path} не существует!")
+
+    print("==========================\n")
+
+
+# Вызываем диагностику при старте
+check_models_path()
+
+
 def run_async(coro):
     """
     Безопасный запуск асинхронной корутины в синхронном контексте
@@ -112,12 +153,105 @@ def handle_nan(obj):
     return obj
 
 
+class RecommendationMetrics:
+    """Метрики качества рекомендаций"""
+
+    @staticmethod
+    def precision_at_k(recommended: List[str], relevant: List[str], k: int) -> float:
+        """Precision@K"""
+        if not recommended or k == 0:
+            return 0.0
+
+        recommended_k = recommended[:k]
+        relevant_set = set(relevant)
+        hits = sum(1 for item in recommended_k if item in relevant_set)
+        return hits / k
+
+    @staticmethod
+    def recall_at_k(recommended: List[str], relevant: List[str], k: int) -> float:
+        """Recall@K"""
+        if not relevant:
+            return 0.0
+
+        recommended_k = set(recommended[:k])
+        relevant_set = set(relevant)
+        hits = len(recommended_k & relevant_set)
+        return hits / len(relevant_set)
+
+    @staticmethod
+    def ndcg_at_k(recommended: List[str], relevant: List[str],
+                  relevance_scores: Dict[str, float], k: int) -> float:
+        """NDCG@K"""
+        if not recommended or not relevance_scores:
+            return 0.0
+
+        recommended_k = recommended[:k]
+
+        # DCG
+        dcg = 0.0
+        for i, item in enumerate(recommended_k):
+            rel = relevance_scores.get(item, 0)
+            dcg += rel / np.log2(i + 2)
+
+        # IDCG - идеальный порядок
+        ideal_relevant = sorted(relevant,
+                                key=lambda x: relevance_scores.get(x, 0),
+                                reverse=True)[:k]
+
+        idcg = 0.0
+        for i, item in enumerate(ideal_relevant):
+            rel = relevance_scores.get(item, 0)
+            idcg += rel / np.log2(i + 2)
+
+        return dcg / idcg if idcg > 0 else 0.0
+
+    @staticmethod
+    def map_at_k(recommended: List[str], relevant: List[str], k: int) -> float:
+        """Mean Average Precision@K"""
+        if not relevant or not recommended:
+            return 0.0
+
+        relevant_set = set(relevant)
+        precisions = []
+        hits = 0
+
+        for i, item in enumerate(recommended[:k], 1):
+            if item in relevant_set:
+                hits += 1
+                precisions.append(hits / i)
+
+        return np.mean(precisions) if precisions else 0.0
+
+    @staticmethod
+    def hit_rate_at_k(recommended: List[str], relevant: List[str], k: int) -> float:
+        """Hit Rate@K"""
+        if not relevant:
+            return 0.0
+
+        recommended_k = set(recommended[:k])
+        relevant_set = set(relevant)
+        return 1.0 if recommended_k & relevant_set else 0.0
+
+    @staticmethod
+    def mrr_at_k(recommended: List[str], relevant: List[str], k: int) -> float:
+        """Mean Reciprocal Rank@K"""
+        if not relevant:
+            return 0.0
+
+        relevant_set = set(relevant)
+        for i, item in enumerate(recommended[:k], 1):
+            if item in relevant_set:
+                return 1.0 / i
+        return 0.0
+
+
 class ModelsProvider:
     """Провайдер моделей для онлайн-компонентов"""
 
     def __init__(self, trainer: ModelTrainer, data_pipeline: DataPipeline):
         self.trainer = trainer
         self.data = data_pipeline
+        self.models_path = trainer.models_path
 
         # Инициализация недостающих атрибутов
         self.popularity_scores = None
@@ -141,81 +275,173 @@ class ModelsProvider:
     def _load_additional_data(self):
         """Загрузка дополнительных данных для онлайн-компонентов"""
         try:
+            # Убедимся, что путь правильный
+            models_path = self.trainer.models_path
+            logger.info(f"Загрузка дополнительных данных из: {models_path}")
+
+            # Проверяем существование пути
+            if not os.path.exists(models_path):
+                logger.error(f"Путь к моделям не существует: {models_path}")
+                return
+
             # Загрузка popularity_scores
-            pop_path = os.path.join(self.trainer.models_path, 'popularity_scores.npy')
+            pop_path = os.path.join(models_path, 'popularity_scores.npy')
             if os.path.exists(pop_path):
                 self.popularity_scores = np.load(pop_path)
-                logger.info("popularity_scores загружены")
+                logger.info(f"popularity_scores загружены: {self.popularity_scores.shape}")
+            else:
+                logger.warning(f"popularity_scores.npy не найден в {models_path}")
 
             # Загрузка recency_scores
-            rec_path = os.path.join(self.trainer.models_path, 'recency_scores.npy')
+            rec_path = os.path.join(models_path, 'recency_scores.npy')
             if os.path.exists(rec_path):
                 self.recency_scores = np.load(rec_path)
-                logger.info("recency_scores загружены")
+                logger.info(f"recency_scores загружены: {self.recency_scores.shape}")
+            else:
+                logger.warning(f"recency_scores.npy не найден в {models_path}")
 
             # Загрузка combined_features
-            comb_path = os.path.join(self.trainer.models_path, 'combined_features.npz')
+            comb_path = os.path.join(models_path, 'combined_features.npz')
             if os.path.exists(comb_path):
                 self.combined_features = load_npz(comb_path)
-                logger.info("combined_features загружены")
+                logger.info(f"combined_features загружены: {self.combined_features.shape}")
+            else:
+                logger.warning(f"combined_features.npz не найден в {models_path}")
 
-            # Загрузка списков
-            movie_ids_path = os.path.join(self.trainer.models_path, 'movie_ids.pkl')
+            # Загрузка movie_ids
+            movie_ids_path = os.path.join(models_path, 'movie_ids.pkl')
             if os.path.exists(movie_ids_path):
                 with open(movie_ids_path, 'rb') as f:
                     self.movie_ids = pickle.load(f)
                 logger.info(f"movie_ids загружены: {len(self.movie_ids)}")
+            else:
+                logger.warning(f"movie_ids.pkl не найден в {models_path}")
+                self.movie_ids = []
 
-            # Загрузка индексов
-            movie_indices_path = os.path.join(self.trainer.models_path, 'movie_indices.pkl')
+            # Загрузка movie_indices
+            movie_indices_path = os.path.join(models_path, 'movie_indices.pkl')
             if os.path.exists(movie_indices_path):
                 with open(movie_indices_path, 'rb') as f:
                     self.movie_indices = pickle.load(f)
-                logger.info("movie_indices загружены")
+                logger.info(f"movie_indices загружены: {len(self.movie_indices)}")
+            else:
+                logger.warning(f"movie_indices.pkl не найден в {models_path}")
+                self.movie_indices = {}
 
-            user_indices_path = os.path.join(self.trainer.models_path, 'user_indices.pkl')
+            # Загрузка user_indices
+            user_indices_path = os.path.join(models_path, 'user_indices.pkl')
             if os.path.exists(user_indices_path):
                 with open(user_indices_path, 'rb') as f:
                     self.user_indices = pickle.load(f)
-                logger.info("user_indices загружены")
+                logger.info(f"user_indices загружены: {len(self.user_indices)}")
+            else:
+                logger.warning(f"user_indices.pkl не найден в {models_path}")
+                self.user_indices = {}
 
-            # Загрузка списков пользователей и фильмов
-            user_list_path = os.path.join(self.trainer.models_path, 'user_list.pkl')
+            # Загрузка user_list
+            user_list_path = os.path.join(models_path, 'user_list.pkl')
             if os.path.exists(user_list_path):
                 with open(user_list_path, 'rb') as f:
                     self.user_list = pickle.load(f)
                 logger.info(f"user_list загружены: {len(self.user_list)}")
+            else:
+                logger.warning(f"user_list.pkl не найден в {models_path}")
+                self.user_list = []
 
-            movie_list_path = os.path.join(self.trainer.models_path, 'movie_list.pkl')
+            # Загрузка movie_list
+            movie_list_path = os.path.join(models_path, 'movie_list.pkl')
             if os.path.exists(movie_list_path):
                 with open(movie_list_path, 'rb') as f:
                     self.movie_list = pickle.load(f)
                 logger.info(f"movie_list загружены: {len(self.movie_list)}")
+            else:
+                logger.warning(f"movie_list.pkl не найден в {models_path}")
+                self.movie_list = []
 
         except Exception as e:
             logger.error(f"Ошибка загрузки дополнительных данных: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _load_models(self):
         """Загрузка моделей из файлов"""
-        self.trainer.load_models()
+
+        # Убедимся, что путь правильный
+        models_path = self.trainer.models_path
+        logger.info(f"Загрузка моделей из: {models_path}")
+
+        # Загружаем модели через trainer
+        success = self.trainer.load_models()
+
+        if not success:
+            logger.warning("Не удалось загрузить модели через trainer.load_models()")
+
+            # Пробуем загрузить вручную
+            try:
+                # Загрузка SVD модели
+                svd_path = os.path.join(models_path, 'svd_model.pkl')
+                if os.path.exists(svd_path):
+                    with open(svd_path, 'rb') as f:
+                        self.trainer.svd_model = pickle.load(f)
+                    logger.info("SVD модель загружена вручную")
+
+                # Загрузка ALS модели
+                als_path = os.path.join(models_path, 'als_model.pkl')
+                if os.path.exists(als_path):
+                    with open(als_path, 'rb') as f:
+                        self.trainer.als_model = pickle.load(f)
+                    logger.info("ALS модель загружена вручную")
+
+                # Загрузка модели предсказания
+                rating_path = os.path.join(models_path, 'rating_predictor.pkl')
+                if os.path.exists(rating_path):
+                    with open(rating_path, 'rb') as f:
+                        self.trainer.rating_predictor = pickle.load(f)
+                    logger.info("Rating predictor загружен вручную")
+
+                # Загрузка факторов
+                user_factors_path = os.path.join(models_path, 'user_factors.npy')
+                if os.path.exists(user_factors_path):
+                    self.trainer.user_factors = np.load(user_factors_path)
+                    logger.info(f"user_factors загружены: {self.trainer.user_factors.shape}")
+
+                item_factors_path = os.path.join(models_path, 'item_factors.npy')
+                if os.path.exists(item_factors_path):
+                    self.trainer.item_factors = np.load(item_factors_path)
+                    logger.info(f"item_factors загружены: {self.trainer.item_factors.shape}")
+
+                # Загрузка NMF факторов
+                user_factors_nmf_path = os.path.join(models_path, 'user_factors_nmf.npy')
+                if os.path.exists(user_factors_nmf_path):
+                    self.trainer.user_factors_nmf = np.load(user_factors_nmf_path)
+                    logger.info(f"user_factors_nmf загружены: {self.trainer.user_factors_nmf.shape}")
+
+                item_factors_nmf_path = os.path.join(models_path, 'item_factors_nmf.npy')
+                if os.path.exists(item_factors_nmf_path):
+                    self.trainer.item_factors_nmf = np.load(item_factors_nmf_path)
+                    logger.info(f"item_factors_nmf загружены: {self.trainer.item_factors_nmf.shape}")
+
+            except Exception as e:
+                logger.error(f"Ошибка ручной загрузки моделей: {e}")
 
         # Загрузка данных
         try:
-            movies_path = os.path.join(self.trainer.models_path, 'movies_df.pkl')
+            movies_path = os.path.join(models_path, 'movies_df.pkl')
             if os.path.exists(movies_path):
                 self.movies_df = pd.read_pickle(movies_path)
                 logger.info(f"movies_df загружен: {len(self.movies_df)} фильмов")
             else:
                 self.movies_df = None
+                logger.warning(f"movies_df.pkl не найден в {models_path}")
 
-            user_main_path = os.path.join(self.trainer.models_path, 'user_main_df.pkl')
+            user_main_path = os.path.join(models_path, 'user_main_df.pkl')
             if os.path.exists(user_main_path):
                 self.user_main_df = pd.read_pickle(user_main_path)
                 logger.info(f"user_main_df загружен: {len(self.user_main_df)} пользователей")
             else:
                 self.user_main_df = None
 
-            genres_path = os.path.join(self.trainer.models_path, 'genres_df.pkl')
+            genres_path = os.path.join(models_path, 'genres_df.pkl')
             if os.path.exists(genres_path):
                 self.genres_df = pd.read_pickle(genres_path)
                 logger.info("genres_df загружен")
@@ -343,84 +569,105 @@ class ModelsProvider:
             return []
 
     def predict_rating(self, user_id: str, movie_id: str) -> float:
-        """Предсказание оценки с правильным количеством признаков"""
+        """Предсказание оценки"""
         if self.trainer.rating_predictor is None:
             logger.debug("Модель предсказания не загружена")
             return 0.5
 
         try:
-            # Проверяем наличие индексов
+            # Используем загруженные индексы из self, а не self.data
             if not hasattr(self, 'user_indices') or self.user_indices is None:
+                logger.debug("user_indices не загружены в ModelsProvider")
                 return 0.5
             if not hasattr(self, 'movie_indices') or self.movie_indices is None:
+                logger.debug("movie_indices не загружены в ModelsProvider")
                 return 0.5
 
-            if user_id not in self.user_indices or movie_id not in self.movie_indices:
+            # Приводим ID к строке для сравнения
+            user_id_str = str(user_id)
+            movie_id_str = str(movie_id)
+
+            if user_id_str not in self.user_indices:
+                logger.debug(f"Пользователь {user_id_str} не найден в индексах")
+                return 0.5
+            if movie_id_str not in self.movie_indices:
+                logger.debug(f"Фильм {movie_id_str} не найден в индексах")
                 return 0.5
 
-            user_idx = self.user_indices[user_id]
-            movie_idx = self.movie_indices[movie_id]
+            user_idx = self.user_indices[user_id_str]
+            movie_idx = self.movie_indices[movie_id_str]
 
             # Проверяем наличие факторов
             if not hasattr(self.trainer, 'user_factors') or self.trainer.user_factors is None:
+                logger.debug("user_factors не загружены")
                 return 0.5
             if not hasattr(self.trainer, 'item_factors') or self.trainer.item_factors is None:
+                logger.debug("item_factors не загружены")
                 return 0.5
 
-            if user_idx >= len(self.trainer.user_factors) or movie_idx >= len(self.trainer.item_factors):
+            if user_idx >= len(self.trainer.user_factors):
+                logger.debug(f"Индекс пользователя {user_idx} вне диапазона")
+                return 0.5
+            if movie_idx >= len(self.trainer.item_factors):
+                logger.debug(f"Индекс фильма {movie_idx} вне диапазона")
                 return 0.5
 
             # Определяем размерности факторов
-            user_factor_dim = min(20, self.trainer.user_factors.shape[1] if len(
-                self.trainer.user_factors.shape) > 1 else 20)
-            item_factor_dim = min(20, self.trainer.item_factors.shape[1] if len(
-                self.trainer.item_factors.shape) > 1 else 20)
+            user_factor_dim = min(100, self.trainer.user_factors.shape[1] if len(
+                self.trainer.user_factors.shape) > 1 else 100)
+            item_factor_dim = min(100, self.trainer.item_factors.shape[1] if len(
+                self.trainer.item_factors.shape) > 1 else 100)
 
-            # Берем первые 20 признаков (или меньше, если их нет)
+            # Берем признаки
             user_vec = self.trainer.user_factors[user_idx][:user_factor_dim] if user_factor_dim > 0 else np.array(
-                [0.5] * 20)
+                [0.5] * 100)
             item_vec = self.trainer.item_factors[movie_idx][:item_factor_dim] if item_factor_dim > 0 else np.array(
-                [0.5] * 20)
+                [0.5] * 100)
 
-            # Дополняем до 20, если нужно
-            if len(user_vec) < 20:
-                user_vec = np.pad(user_vec, (0, 20 - len(user_vec)), constant_values=0.5)
-            if len(item_vec) < 20:
-                item_vec = np.pad(item_vec, (0, 20 - len(item_vec)), constant_values=0.5)
+            # Дополняем до 100, если нужно
+            if len(user_vec) < 100:
+                user_vec = np.pad(user_vec, (0, 100 - len(user_vec)), constant_values=0.5)
+            if len(item_vec) < 100:
+                item_vec = np.pad(item_vec, (0, 100 - len(item_vec)), constant_values=0.5)
 
-            # Формируем признаки - ВСЕГДА 72 признака
+            # Формируем признаки - 310 признаков (как при обучении)
             features_list = []
 
-            # 1. SVD признаки (40 признаков: 20 пользовательских + 20 фильмовых)
-            features_list.extend(user_vec[:20])
-            features_list.extend(item_vec[:20])
+            # 1. SVD признаки (200 признаков)
+            features_list.extend(user_vec[:100])
+            features_list.extend(item_vec[:100])
 
-            # 2. NMF признаки (30 признаков: 15 пользовательских + 15 фильмовых)
+            # 2. NMF признаки (100 признаков)
             if hasattr(self.trainer, 'user_factors_nmf') and self.trainer.user_factors_nmf is not None:
                 if user_idx < len(self.trainer.user_factors_nmf):
-                    nmf_user = self.trainer.user_factors_nmf[user_idx][:15] if len(
-                        self.trainer.user_factors_nmf[user_idx]) >= 15 else self.trainer.user_factors_nmf[user_idx]
-                    if len(nmf_user) < 15:
-                        nmf_user = np.pad(nmf_user, (0, 15 - len(nmf_user)), constant_values=0.5)
-                    features_list.extend(nmf_user)
+                    nmf_user = self.trainer.user_factors_nmf[user_idx][:50] if len(
+                        self.trainer.user_factors_nmf[user_idx]) >= 50 else self.trainer.user_factors_nmf[user_idx]
+                    if len(nmf_user) < 50:
+                        nmf_user = np.pad(nmf_user, (0, 50 - len(nmf_user)), constant_values=0.5)
+                    features_list.extend(nmf_user[:50])
                 else:
-                    features_list.extend([0.5] * 15)
+                    features_list.extend([0.5] * 50)
             else:
-                features_list.extend([0.5] * 15)
+                features_list.extend([0.5] * 50)
 
             if hasattr(self.trainer, 'item_factors_nmf') and self.trainer.item_factors_nmf is not None:
                 if movie_idx < len(self.trainer.item_factors_nmf):
-                    nmf_item = self.trainer.item_factors_nmf[movie_idx][:15] if len(
-                        self.trainer.item_factors_nmf[movie_idx]) >= 15 else self.trainer.item_factors_nmf[movie_idx]
-                    if len(nmf_item) < 15:
-                        nmf_item = np.pad(nmf_item, (0, 15 - len(nmf_item)), constant_values=0.5)
-                    features_list.extend(nmf_item)
+                    nmf_item = self.trainer.item_factors_nmf[movie_idx][:50] if len(
+                        self.trainer.item_factors_nmf[movie_idx]) >= 50 else self.trainer.item_factors_nmf[movie_idx]
+                    if len(nmf_item) < 50:
+                        nmf_item = np.pad(nmf_item, (0, 50 - len(nmf_item)), constant_values=0.5)
+                    features_list.extend(nmf_item[:50])
                 else:
-                    features_list.extend([0.5] * 15)
+                    features_list.extend([0.5] * 50)
             else:
-                features_list.extend([0.5] * 15)
+                features_list.extend([0.5] * 50)
 
-            # 3. Дополнительные признаки (2 признака: популярность + свежесть)
+            # 3. Статистические признаки (5)
+            user_rating_count = 0.5
+            movie_rating_count = 0.5
+            features_list.extend([user_rating_count, movie_rating_count, 0.5, 0.5, 0.25])
+
+            # 4. Популярность и свежесть (2)
             if hasattr(self, 'popularity_scores') and self.popularity_scores is not None and movie_idx < len(
                     self.popularity_scores):
                 features_list.append(float(self.popularity_scores[movie_idx]))
@@ -433,31 +680,79 @@ class ModelsProvider:
             else:
                 features_list.append(0.5)
 
+            # 5. Взаимодействие признаков (3)
+            features_list.extend([0.25, 0.25, 0.125])
+
             # Проверяем количество признаков
-            expected_features = 72  # 20+20+15+15+2 = 72
+            expected_features = 310
             current_features = len(features_list)
 
             if current_features < expected_features:
-                # Дополняем до 72
                 features_list.extend([0.5] * (expected_features - current_features))
             elif current_features > expected_features:
-                # Обрезаем до 72
                 features_list = features_list[:expected_features]
 
-            features = np.array(features_list).reshape(1, -1)
+            features = np.array(features_list, dtype=np.float32).reshape(1, -1)
 
             # Обработка NaN и inf
             features = np.nan_to_num(features, nan=0.5, posinf=0.5, neginf=0.5)
 
             # Предсказание
-            prediction = self.trainer.rating_predictor.predict(features)[0]
-            return max(0, min(1, prediction))
+            if hasattr(self.trainer.rating_predictor, 'predict'):
+                prediction = self.trainer.rating_predictor.predict(features)[0]
+
+                # Если есть трансформер, применяем обратное преобразование
+                if hasattr(self.trainer, 'rating_transformer') and self.trainer.rating_transformer is not None:
+                    prediction = self.trainer.rating_transformer.inverse_transform([[prediction]])[0, 0]
+
+                # Нормализуем от 0 до 1
+                prediction = max(0, min(1, prediction))
+                return prediction
+
+            return 0.5
 
         except Exception as e:
             logger.error(f"Ошибка предсказания: {e}")
             import traceback
             traceback.print_exc()
             return 0.5
+
+    def _get_user_index(self, user_id: str) -> Optional[int]:
+        """Получение индекса пользователя с поиском по разным форматам"""
+        # Прямой поиск
+        if user_id in self.user_indices:
+            return self.user_indices[user_id]
+
+        # Поиск по нормализованному URL
+        normalized = self._normalize_user_url(user_id)
+        if normalized in self.user_indices:
+            return self.user_indices[normalized]
+
+        # Поиск по user_list
+        if hasattr(self, 'user_list') and self.user_list:
+            try:
+                return self.user_list.index(normalized)
+            except ValueError:
+                pass
+
+        return None
+
+    def _normalize_user_url(self, user_url: str) -> str:
+        """Нормализация URL пользователя"""
+        if not user_url:
+            return ''
+
+        normalized = str(user_url).strip()
+        normalized = normalized.replace('https://www.imdb.com', '')
+        normalized = normalized.replace('http://www.imdb.com', '')
+        normalized = normalized.rstrip('/')
+        normalized = normalized.split('?')[0]
+
+        # Убираем лишние слеши
+        while '//' in normalized:
+            normalized = normalized.replace('//', '/')
+
+        return normalized
 
     def _load_compatibility_data(self):
         """Загрузка данных для обратной совместимости со старыми эндпоинтами"""
@@ -704,119 +999,65 @@ class ModelsProvider:
             return []
 
         try:
-            movie_idx = self.data.movie_ids.index(movie_id) if hasattr(self.data, 'movie_ids') else None
-            if movie_idx is None:
+            # Проверяем наличие movie_ids и combined_features
+            if not hasattr(self, 'movie_ids') or self.movie_ids is None:
+                logger.warning("movie_ids не загружены")
+                return []
+
+            if not hasattr(self, 'combined_features') or self.combined_features is None:
+                logger.warning("combined_features не загружены")
+                return []
+
+            # Находим индекс фильма
+            movie_id_str = str(movie_id)
+            if movie_id_str not in self.movie_ids:
+                # Пробуем найти по частичному совпадению
+                for mid in self.movie_ids:
+                    if movie_id_str in str(mid):
+                        movie_idx = self.movie_ids.index(mid)
+                        break
+                else:
+                    logger.debug(f"Фильм {movie_id} не найден в индексах")
+                    return []
+            else:
+                movie_idx = self.movie_ids.index(movie_id_str)
+
+            if movie_idx >= self.combined_features.shape[0]:
+                logger.warning(f"Индекс {movie_idx} вне диапазона combined_features")
                 return []
 
             distances, indices = self.trainer.nn_model.kneighbors(
-                self.data.combined_features[movie_idx],
+                self.combined_features[movie_idx],
                 n_neighbors=n + 1
             )
 
             recommendations = []
             for i, idx in enumerate(indices[0][1:]):
-                movie = self.movies_df.iloc[idx]
-                recommendations.append({
-                    'movie_id': movie['movie_id'],
-                    'title': movie['title'],
-                    'year': movie['year'],
-                    'similarity': 1 - distances[0][i + 1]
-                })
+                if idx < len(self.movie_ids):
+                    movie_id_result = self.movie_ids[idx]
+                    if self.movies_df is not None:
+                        movie = self.movies_df[self.movies_df['movie_id'] == movie_id_result]
+                        if len(movie) > 0:
+                            recommendations.append({
+                                'movie_id': movie_id_result,
+                                'title': movie.iloc[0].get('title', ''),
+                                'year': movie.iloc[0].get('year', ''),
+                                'similarity': float(1 - distances[0][i + 1])
+                            })
+                        else:
+                            recommendations.append({
+                                'movie_id': movie_id_result,
+                                'title': str(movie_id_result),
+                                'year': '',
+                                'similarity': float(1 - distances[0][i + 1])
+                            })
 
             return recommendations
         except Exception as e:
             logger.error(f"Ошибка поиска похожих: {e}")
+            import traceback
+            traceback.print_exc()
             return []
-
-    def get_svd_recommendations(self, user_id: str, n: int = 50) -> List[Dict]:
-        """SVD рекомендации"""
-        if self.trainer.svd_model is None or not hasattr(self.data, 'user_indices'):
-            return []
-
-        try:
-            if user_id not in self.data.user_indices:
-                return []
-
-            user_idx = self.data.user_indices[user_id]
-            user_vector = self.trainer.user_factors[user_idx]
-            predicted = user_vector @ self.trainer.item_factors.T
-
-            top_indices = np.argsort(predicted)[::-1][:n]
-
-            recommendations = []
-            for idx in top_indices:
-                if idx < len(self.data.movie_list):
-                    movie_id = self.data.movie_list[idx]
-                    movie = self.movies_df[self.movies_df['movie_id'] == movie_id]
-                    if len(movie) > 0:
-                        recommendations.append({
-                            'movie_id': movie_id,
-                            'title': movie.iloc[0]['title'],
-                            'score': float(predicted[idx])
-                        })
-
-            return recommendations
-        except Exception as e:
-            logger.error(f"Ошибка SVD: {e}")
-            return []
-
-    def get_als_recommendations(self, user_id: str, n: int = 50) -> List[Dict]:
-        """ALS рекомендации"""
-        if self.trainer.als_model is None or not hasattr(self.data, 'user_indices'):
-            return []
-
-        try:
-            if user_id not in self.data.user_indices:
-                return []
-
-            user_idx = self.data.user_indices[user_id]
-            recommendations = self.trainer.als_model.recommend(
-                user_idx,
-                self.data.user_item_matrix.T,
-                N=n
-            )
-
-            result = []
-            for movie_idx, score in recommendations:
-                if movie_idx < len(self.data.movie_list):
-                    movie_id = self.data.movie_list[movie_idx]
-                    movie = self.movies_df[self.movies_df['movie_id'] == movie_id]
-                    if len(movie) > 0:
-                        result.append({
-                            'movie_id': movie_id,
-                            'title': movie.iloc[0]['title'],
-                            'score': float(score)
-                        })
-
-            return result
-        except Exception as e:
-            logger.error(f"Ошибка ALS: {e}")
-            return []
-
-    def predict_rating(self, user_id: str, movie_id: str) -> float:
-        """Предсказание оценки"""
-        if self.trainer.rating_predictor is None:
-            return 0.5
-
-        try:
-            if user_id not in self.data.user_indices or movie_id not in self.data.movie_indices:
-                return 0.5
-
-            user_idx = self.data.user_indices[user_id]
-            movie_idx = self.data.movie_indices[movie_id]
-
-            features = np.concatenate([
-                self.trainer.user_factors[user_idx][:20],
-                self.trainer.item_factors[movie_idx][:20],
-                [self.data.popularity_scores[movie_idx]],
-                [self.data.recency_scores[movie_idx]]
-            ])
-
-            prediction = self.trainer.rating_predictor.predict([features])[0]
-            return max(0, min(1, prediction))
-        except Exception as e:
-            logger.error(f"Ошибка предсказания: {e}")
-            return 0.5
 
     def get_russian_genre(self, genre_en):
         """Получение русского названия жанра"""
@@ -3509,6 +3750,263 @@ def check_movie_favorite(movie_id):
     except Exception as e:
         logger.error(f"Ошибка проверки избранного: {e}")
         return jsonify({'favorite': False})
+
+
+@app.route('/api/metrics/evaluate', methods=['POST'])
+def evaluate_recommendations():
+    """Оценка качества рекомендаций по Precision@K, Recall@K, NDCG@K"""
+    data = request.json
+    user_id = data.get('user_id')
+    k = data.get('k', 10)
+
+    if not user_id:
+        return jsonify({'error': 'user_id is required'}), 400
+
+    # Получаем рекомендации
+    if loop is None or loop.is_closed():
+        current_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(current_loop)
+        recommendations = current_loop.run_until_complete(
+            get_recommendations_for_user(user_id, {})
+        )
+        current_loop.close()
+    else:
+        recommendations = loop.run_until_complete(
+            get_recommendations_for_user(user_id, {})
+        )
+
+    # Извлекаем ID рекомендованных фильмов
+    recommended_ids = [rec.get('movie_id') for rec in recommendations[:k] if rec.get('movie_id')]
+
+    # Получаем реальные оценки пользователя
+    actual_ratings = data_provider.get_user_watched_movies(user_id)
+
+    # Релевантные фильмы (оценка >= 7 из 10)
+    relevant_ids = [m['movie_id'] for m in actual_ratings if m.get('rating', 0) >= 7]
+
+    # Создаем словарь с реальными оценками для NDCG
+    relevance_scores = {}
+    for movie in actual_ratings:
+        movie_id = movie.get('movie_id')
+        rating = movie.get('rating', 0)
+        if rating >= 7:
+            # Нормализуем оценку для NDCG: 7->0.7, 8->0.8, 9->0.9, 10->1.0
+            relevance_scores[movie_id] = (rating - 6) / 4  # 7->0.25, 8->0.5, 9->0.75, 10->1.0
+        else:
+            relevance_scores[movie_id] = 0
+
+    # Вычисляем метрики
+    metrics = {
+        'user_id': user_id,
+        'k': k,
+        'total_recommendations': len(recommendations),
+        'total_relevant': len(relevant_ids),
+        'precision@k': RecommendationMetrics.precision_at_k(recommended_ids, relevant_ids, k),
+        'recall@k': RecommendationMetrics.recall_at_k(recommended_ids, relevant_ids, k),
+        'ndcg@k': RecommendationMetrics.ndcg_at_k(recommended_ids, relevant_ids, relevance_scores, k),
+        'map@k': RecommendationMetrics.map_at_k(recommended_ids, relevant_ids, k),
+        'hit_rate@k': RecommendationMetrics.hit_rate_at_k(recommended_ids, relevant_ids, k)
+    }
+
+    # Добавляем дополнительную статистику
+    if len(recommended_ids) > 0:
+        hits = [m for m in recommended_ids[:k] if m in set(relevant_ids)]
+        metrics['hits'] = hits
+        metrics['hits_count'] = len(hits)
+
+    return jsonify(metrics)
+
+
+@app.route('/api/metrics/evaluate/batch', methods=['POST'])
+def evaluate_batch_metrics():
+    """Пакетная оценка качества для множества пользователей"""
+    data = request.json
+    user_ids = data.get('user_ids', [])
+    k = data.get('k', 10)
+    sample_size = data.get('sample_size', 100)
+
+    if not user_ids:
+        # Если список не указан, берем случайных пользователей
+        if data_provider and data_provider.user_main_df is not None:
+            user_ids = data_provider.user_main_df['user_url'].head(sample_size).tolist()
+        else:
+            return jsonify({'error': 'No users available'}), 400
+
+    all_metrics = {
+        'precision': [],
+        'recall': [],
+        'ndcg': [],
+        'map': [],
+        'hit_rate': []
+    }
+
+    for user_id in user_ids[:sample_size]:
+        try:
+            # Получаем рекомендации
+            if loop is None or loop.is_closed():
+                current_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(current_loop)
+                recommendations = current_loop.run_until_complete(
+                    get_recommendations_for_user(user_id, {})
+                )
+                current_loop.close()
+            else:
+                recommendations = loop.run_until_complete(
+                    get_recommendations_for_user(user_id, {})
+                )
+
+            recommended_ids = [rec.get('movie_id') for rec in recommendations[:k] if rec.get('movie_id')]
+
+            # Получаем реальные оценки
+            actual_ratings = data_provider.get_user_watched_movies(user_id)
+            relevant_ids = [m['movie_id'] for m in actual_ratings if m.get('rating', 0) >= 7]
+
+            # Создаем relevance scores
+            relevance_scores = {}
+            for movie in actual_ratings:
+                movie_id = movie.get('movie_id')
+                rating = movie.get('rating', 0)
+                if rating >= 7:
+                    relevance_scores[movie_id] = (rating - 6) / 4
+                else:
+                    relevance_scores[movie_id] = 0
+
+            # Вычисляем метрики
+            if relevant_ids:  # Только если у пользователя есть оценки
+                all_metrics['precision'].append(
+                    RecommendationMetrics.precision_at_k(recommended_ids, relevant_ids, k)
+                )
+                all_metrics['recall'].append(
+                    RecommendationMetrics.recall_at_k(recommended_ids, relevant_ids, k)
+                )
+                all_metrics['ndcg'].append(
+                    RecommendationMetrics.ndcg_at_k(recommended_ids, relevant_ids, relevance_scores, k)
+                )
+                all_metrics['map'].append(
+                    RecommendationMetrics.map_at_k(recommended_ids, relevant_ids, k)
+                )
+                all_metrics['hit_rate'].append(
+                    RecommendationMetrics.hit_rate_at_k(recommended_ids, relevant_ids, k)
+                )
+        except Exception as e:
+            logger.error(f"Error evaluating user {user_id}: {e}")
+            continue
+
+    # Агрегируем результаты
+    results = {
+        'total_users_evaluated': len(all_metrics['precision']),
+        'k': k,
+        'average_metrics': {
+            'precision@k': np.mean(all_metrics['precision']) if all_metrics['precision'] else 0,
+            'recall@k': np.mean(all_metrics['recall']) if all_metrics['recall'] else 0,
+            'ndcg@k': np.mean(all_metrics['ndcg']) if all_metrics['ndcg'] else 0,
+            'map@k': np.mean(all_metrics['map']) if all_metrics['map'] else 0,
+            'hit_rate@k': np.mean(all_metrics['hit_rate']) if all_metrics['hit_rate'] else 0
+        },
+        'std_metrics': {
+            'precision@k': np.std(all_metrics['precision']) if all_metrics['precision'] else 0,
+            'recall@k': np.std(all_metrics['recall']) if all_metrics['recall'] else 0,
+            'ndcg@k': np.std(all_metrics['ndcg']) if all_metrics['ndcg'] else 0,
+            'map@k': np.std(all_metrics['map']) if all_metrics['map'] else 0,
+            'hit_rate@k': np.std(all_metrics['hit_rate']) if all_metrics['hit_rate'] else 0
+        },
+        'percentiles': {
+            'precision@k': {
+                'p25': np.percentile(all_metrics['precision'], 25) if all_metrics['precision'] else 0,
+                'p50': np.percentile(all_metrics['precision'], 50) if all_metrics['precision'] else 0,
+                'p75': np.percentile(all_metrics['precision'], 75) if all_metrics['precision'] else 0
+            },
+            'recall@k': {
+                'p25': np.percentile(all_metrics['recall'], 25) if all_metrics['recall'] else 0,
+                'p50': np.percentile(all_metrics['recall'], 50) if all_metrics['recall'] else 0,
+                'p75': np.percentile(all_metrics['recall'], 75) if all_metrics['recall'] else 0
+            }
+        }
+    }
+
+    return jsonify(results)
+
+
+@app.route('/api/metrics/holdout', methods=['POST'])
+def evaluate_holdout():
+    """
+    Оценка качества на holdout выборке (последние 20% оценок пользователя)
+    """
+    data = request.json
+    user_id = data.get('user_id')
+    test_ratio = data.get('test_ratio', 0.2)  # 20% на тест
+    k = data.get('k', 10)
+
+    if not user_id:
+        return jsonify({'error': 'user_id is required'}), 400
+
+    # Получаем все оценки пользователя
+    actual_ratings = data_provider.get_user_watched_movies(user_id)
+
+    if len(actual_ratings) < 5:
+        return jsonify({'error': 'Not enough ratings for evaluation (need at least 5)'}), 400
+
+    # Сортируем по дате
+    sorted_ratings = sorted(actual_ratings, key=lambda x: x.get('date', ''), reverse=True)
+
+    # Разделяем на train (первые 80%) и test (последние 20%)
+    split_idx = int(len(sorted_ratings) * (1 - test_ratio))
+    train_ratings = sorted_ratings[:split_idx]
+    test_ratings = sorted_ratings[split_idx:]
+
+    # Используем train для получения рекомендаций (через историю)
+    # Для этого нужно временно модифицировать контекст
+
+    # Получаем рекомендации на основе train
+    context = {
+        'user_rated_movies': [m['movie_id'] for m in train_ratings],
+        'user_ratings': {m['movie_id']: m.get('rating', 0) for m in train_ratings}
+    }
+
+    if loop is None or loop.is_closed():
+        current_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(current_loop)
+        recommendations = current_loop.run_until_complete(
+            get_recommendations_for_user(user_id, context)
+        )
+        current_loop.close()
+    else:
+        recommendations = loop.run_until_complete(
+            get_recommendations_for_user(user_id, context)
+        )
+
+    recommended_ids = [rec.get('movie_id') for rec in recommendations[:k] if rec.get('movie_id')]
+
+    # Релевантные из test (оценка >= 7)
+    relevant_ids = [m['movie_id'] for m in test_ratings if m.get('rating', 0) >= 7]
+
+    # Relevance scores для NDCG
+    relevance_scores = {}
+    for movie in test_ratings:
+        movie_id = movie.get('movie_id')
+        rating = movie.get('rating', 0)
+        if rating >= 7:
+            relevance_scores[movie_id] = (rating - 6) / 4
+        else:
+            relevance_scores[movie_id] = 0
+
+    # Вычисляем метрики
+    metrics = {
+        'user_id': user_id,
+        'train_size': len(train_ratings),
+        'test_size': len(test_ratings),
+        'test_ratio': test_ratio,
+        'k': k,
+        'recommendations': recommended_ids[:k],
+        'precision@k': RecommendationMetrics.precision_at_k(recommended_ids, relevant_ids, k),
+        'recall@k': RecommendationMetrics.recall_at_k(recommended_ids, relevant_ids, k),
+        'ndcg@k': RecommendationMetrics.ndcg_at_k(recommended_ids, relevant_ids, relevance_scores, k),
+        'map@k': RecommendationMetrics.map_at_k(recommended_ids, relevant_ids, k),
+        'hit_rate@k': RecommendationMetrics.hit_rate_at_k(recommended_ids, relevant_ids, k)
+    }
+
+    return jsonify(metrics)
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

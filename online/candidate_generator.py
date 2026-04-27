@@ -192,9 +192,12 @@ class CandidateGenerator:
     def _find_similar_users(self, user_ratings: Dict[str, float], top_n: int = 20) -> List[Tuple[str, float]]:
         """Находит пользователей с похожими оценками"""
         try:
-            # Загружаем все ревью
-            reviews_path = os.path.join(self.models.models_path, 'reviews_df.pkl') if hasattr(self.models,
-                                                                                              'models_path') else 'models/reviews_df.pkl'
+            # Получаем путь к моделям правильно
+            models_path = getattr(self.models, 'models_path', None)
+            if not models_path and hasattr(self.models, 'trainer'):
+                models_path = getattr(self.models.trainer, 'models_path', 'models')
+
+            reviews_path = os.path.join(models_path, 'reviews_df.pkl') if models_path else 'models/reviews_df.pkl'
 
             if os.path.exists(reviews_path):
                 reviews_df = pd.read_pickle(reviews_path)

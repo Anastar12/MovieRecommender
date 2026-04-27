@@ -15,6 +15,7 @@ import logging
 from typing import Dict, List, Tuple, Optional
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
 logger = logging.getLogger(__name__)
 
@@ -362,38 +363,85 @@ class DataPipeline:
         self.genre_vectors = csr_matrix(genre_matrix)
         logger.info(f"Жанровые векторы: {self.genre_vectors.shape}")
 
-        # Актеры (топ-500)
-        all_actors = set()
-        for actors in self.movies_df['actors'].str.split(','):
+        # ============= АКТЕРЫ: топ-2000 по частоте =============
+        # Собираем всех актеров с подсчетом частоты
+        actor_counter = Counter()
+
+        for actors in self.movies_df['actors_ru'].fillna('').str.split(','):
             if isinstance(actors, list):
-                all_actors.update([a.strip() for a in actors if a.strip()])
+                for actor in actors:
+                    actor = actor.strip()
+                    if actor and actor != 'nan' and actor != '':
+                        actor_counter[actor] += 1
 
-        self.top_actors = sorted(list(all_actors))[:500]
+        # Если русских актеров мало, используем английские
+        if len(actor_counter) < 100:
+            for actors in self.movies_df['actors'].fillna('').str.split(','):
+                if isinstance(actors, list):
+                    for actor in actors:
+                        actor = actor.strip()
+                        if actor and actor != 'nan' and actor != '':
+                            actor_counter[actor] += 1
+
+        # Берем топ-2000 самых частых актеров
+        self.top_actors = [actor for actor, _ in actor_counter.most_common(2000)]
+        logger.info(f"Топ-2000 актеров по частоте: {len(self.top_actors)}")
+        logger.info(
+            f"Самый частый актер: {self.top_actors[0] if self.top_actors else 'None'} ({actor_counter.get(self.top_actors[0], 0)} раз)")
+
+        # Создаем матрицу для топ-2000 актеров
         actor_to_idx = {a: i for i, a in enumerate(self.top_actors)}
-
         actor_matrix = np.zeros((len(self.movies_df), len(self.top_actors)))
+
         for idx, row in self.movies_df.iterrows():
-            actors = [a.strip() for a in str(row['actors']).split(',') if a.strip()]
-            for actor in actors[:10]:
+            # Пробуем получить русские имена
+            actors = [a.strip() for a in str(row.get('actors_ru', '')).split(',') if a.strip() and a.strip() != 'nan']
+            # Если нет русских, берем английские
+            if not actors:
+                actors = [a.strip() for a in str(row.get('actors', '')).split(',') if a.strip() and a.strip() != 'nan']
+
+            for actor in actors:
                 if actor in actor_to_idx:
                     actor_matrix[idx, actor_to_idx[actor]] = 1
 
         self.actor_vectors = csr_matrix(actor_matrix)
         logger.info(f"Актеры: {self.actor_vectors.shape}")
 
-        # Режиссеры (топ-200)
-        all_directors = set()
-        for directors in self.movies_df['directors'].str.split(','):
+        # ============= РЕЖИССЕРЫ: топ-500 по частоте =============
+        director_counter = Counter()
+
+        for directors in self.movies_df['directors_ru'].fillna('').str.split(','):
             if isinstance(directors, list):
-                all_directors.update([d.strip() for d in directors if d.strip()])
+                for director in directors:
+                    director = director.strip()
+                    if director and director != 'nan' and director != '':
+                        director_counter[director] += 1
 
-        self.top_directors = sorted(list(all_directors))[:200]
+        if len(director_counter) < 50:
+            for directors in self.movies_df['directors'].fillna('').str.split(','):
+                if isinstance(directors, list):
+                    for director in directors:
+                        director = director.strip()
+                        if director and director != 'nan' and director != '':
+                            director_counter[director] += 1
+
+        # Берем топ-500 самых частых режиссеров
+        self.top_directors = [director for director, _ in director_counter.most_common(500)]
+        logger.info(f"Топ-500 режиссеров по частоте: {len(self.top_directors)}")
+        logger.info(f"Самый частый режиссер: {self.top_directors[0] if self.top_directors else 'None'}")
+
+        # Создаем матрицу для топ-500 режиссеров
         director_to_idx = {d: i for i, d in enumerate(self.top_directors)}
-
         director_matrix = np.zeros((len(self.movies_df), len(self.top_directors)))
+
         for idx, row in self.movies_df.iterrows():
-            directors = [d.strip() for d in str(row['directors']).split(',') if d.strip()]
-            for director in directors[:5]:
+            directors = [d.strip() for d in str(row.get('directors_ru', '')).split(',') if
+                         d.strip() and d.strip() != 'nan']
+            if not directors:
+                directors = [d.strip() for d in str(row.get('directors', '')).split(',') if
+                             d.strip() and d.strip() != 'nan']
+
+            for director in directors:
                 if director in director_to_idx:
                     director_matrix[idx, director_to_idx[director]] = 1
 

@@ -137,6 +137,7 @@ async def pre_train():
                 val_r2 = rating_predictor_result.get('val_r2', 0)
                 train_rmse = rating_predictor_result.get('train_rmse', 0)
                 val_rmse = rating_predictor_result.get('val_rmse', 0)
+                mae = rating_predictor_result.get('mae', 0)
                 train_size = rating_predictor_result.get('train_size', 0)
                 val_size = rating_predictor_result.get('val_size', 0)
 
@@ -147,6 +148,7 @@ async def pre_train():
                 logger.info(f"  - Валидационный R²: {val_r2:.4f}")
                 logger.info(f"  - Обучающий RMSE: {train_rmse:.4f}")
                 logger.info(f"  - Валидационный RMSE: {val_rmse:.4f}")
+                logger.info(f"  - MAE: {mae:.4f}")
 
                 # Дополнительная интерпретация метрики (по валидационному R²)
                 if val_r2 > 0.7:
@@ -187,6 +189,9 @@ async def pre_train():
                     director_norm * 0.1
                 ])
                 logger.info("✓ combined_features создан")
+
+                # Обучаем индекс схожести
+                await model_trainer.build_similarity_index(combined_features)
         except Exception as e:
             logger.warning(f"Не удалось создать combined_features: {e}")
 
@@ -219,10 +224,13 @@ async def pre_train():
             'data_hash': getattr(data_pipeline, 'data_hash', None)
         }
 
+        # Сохраняем данные через data_pipeline
         data_pipeline.save_data(data_for_saving)
+
+        # Сохраняем модели через model_trainer
         model_trainer.save_models()
 
-        logger.info("✓ Все модели сохранены")
+        logger.info("✓ Все данные и модели сохранены")
 
         # Финальная статистика
         logger.info("\n" + "=" * 60)
