@@ -2049,3 +2049,106 @@ body.modal-open {
 .modal.show ~ .modal-backdrop {
     opacity: 0.6;
 }
+
+/* Дополнительные стили для кнопки загрузки */
+.btn-load-more {
+    background: linear-gradient(135deg, #8bc34a 0%, #689f38 100%);
+    border: none;
+    color: #1a1a2e;
+    font-weight: 600;
+    padding: 12px 32px;
+    font-size: 1rem;
+    border-radius: 40px;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 15px rgba(139, 195, 74, 0.2);
+}
+
+.btn-load-more:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(139, 195, 74, 0.3);
+}
+
+.btn-load-more:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.btn-load-more i {
+    margin-right: 8px;
+}
+
+.loading-spinner-small {
+    margin-left: 8px;
+}
+
+/* Адаптивность для разных разрешений */
+@media (max-width: 768px) {
+    .btn-load-more {
+        padding: 10px 24px;
+        font-size: 0.9rem;
+        width: 100%;
+        max-width: 250px;
+    }
+}
+
+@media (max-width: 576px) {
+    .btn-load-more {
+        padding: 8px 20px;
+        font-size: 0.85rem;
+    }
+}
+
+/* Стили для кнопки "Загрузить еще" */
+.btn-load-more {
+    background: linear-gradient(135deg, #8bc34a 0%, #689f38 100%);
+    border: none;
+    color: #1a1a2e;
+    font-weight: 600;
+    padding: 12px 32px;
+    font-size: 1rem;
+    border-radius: 40px;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 15px rgba(139, 195, 74, 0.2);
+}
+
+.btn-load-more:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(139, 195, 74, 0.3);
+    color: #1a1a2e;
+}
+
+.btn-load-more:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.btn-load-more i {
+    margin-right: 8px;
+}
+
+.loading-spinner-small {
+    margin-left: 8px;
+    display: inline-block;
+}
+
+.loading-spinner-small i {
+    font-size: 0.9rem;
+    margin: 0;
+}
+
+/* Адаптивность */
+@media (max-width: 768px) {
+    .btn-load-more {
+        padding: 10px 24px;
+        font-size: 0.9rem;
+        width: 100%;
+        max-width: 250px;
+    }
+}
+
+@media (max-width: 576px) {
+    .btn-load-more {
+        padding: 8px 20px;
+        font-size: 0.85rem;
+    }
+}

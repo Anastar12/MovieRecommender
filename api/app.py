@@ -2677,15 +2677,48 @@ def get_user_watched_stats_api(user_url):
 
 @app.route('/api/catalog')
 def get_catalog():
-    """API для получения всех фильмов и доступных фильтров"""
+    """API для получения фильмов с пагинацией offset/limit и фильтрацией"""
     if models_provider is None or models_provider.movies_df is None:
         return jsonify({'error': 'Система не инициализирована'}), 500
 
     try:
+        # Получаем параметры пагинации и фильтрации
+        offset = int(request.args.get('offset', 0))
+        limit = min(int(request.args.get('limit', 20)), 100)
+        sort_by = request.args.get('sort_by', 'rating_desc')
+
+        # Параметры фильтрации
+        filters_str = request.args.get('filters', '{}')
+        try:
+            filters = json.loads(filters_str) if filters_str else {}
+        except json.JSONDecodeError:
+            filters = {}
+
         movies_df = models_provider.movies_df.copy()
 
+        # Загружаем все фильмы для фильтров (один раз при первом запросе)
+        all_movies_for_filters = None
+        if offset == 0:
+            all_movies_for_filters = get_all_movies_for_filters(movies_df, models_provider)
+
+        # Применяем фильтры
+        filtered_df = apply_filters_on_server(movies_df, filters)
+
+        # Применяем сортировку
+        filtered_df = apply_sorting_on_server(filtered_df, sort_by)
+
+        # Общее количество отфильтрованных фильмов
+        total = len(filtered_df)
+
+        # Пагинация offset/limit
+        if offset < len(filtered_df):
+            page_df = filtered_df.iloc[offset:offset + limit]
+        else:
+            page_df = pd.DataFrame()
+
+        # Формируем результат
         movies = []
-        for _, row in movies_df.iterrows():
+        for _, row in page_df.iterrows():
             movie_id = row.get('movie_id')
             if pd.isna(movie_id):
                 continue
@@ -2716,75 +2749,224 @@ def get_catalog():
                 'year': str(row.get('year', '')) if pd.notna(row.get('year')) else None,
                 'imdb_rating': float(row['imdb']) if pd.notna(row.get('imdb')) else None,
                 'poster': get_poster_filename(row.get('title', ''), row.get('year', '')),
-                'genres': genres_ru  # Добавляем жанры
+                'genres': genres_ru
             })
 
-        # Также возвращаем фильтры для модального окна
-        filters_data = {
-            'genres_flat': [],
-            'years': [],
-            'countries': [],
-            'actors': [],
-            'directors': []
+        # Возвращаем фильтры только при первом запросе (offset=0)
+        filters_data = None
+        if offset == 0:
+            filters_data = get_filters_data_cached(movies_df, models_provider.genres_df)
+
+        response_data = {
+            'movies': movies,
+            'total': int(total),
+            'offset': int(offset),
+            'limit': int(limit),
+            'filters': filters_data,
+            'all_movies_for_filters': all_movies_for_filters  # Добавляем для подсчета в фильтрах
         }
 
-        # Собираем уникальные значения для фильтров
-        all_genres = set()
-        all_years = set()
-        all_countries = set()
-        all_actors = set()
-        all_directors = set()
-
-        for _, row in movies_df.iterrows():
-            # Годы
-            year_val = row.get('year')
-            if year_val and pd.notna(year_val):
-                try:
-                    year_int = int(float(year_val))
-                    if 1900 <= year_int <= 2030:
-                        all_years.add(year_int)
-                except:
-                    pass
-
-            # Страны
-            country_val = row.get('country')
-            if country_val and pd.notna(country_val) and isinstance(country_val, str):
-                countries = [c.strip() for c in country_val.split(',') if c.strip()]
-                all_countries.update(countries)
-
-            # Актеры
-            actors_val = row.get('actors_ru', row.get('actors', ''))
-            if actors_val and pd.notna(actors_val) and isinstance(actors_val, str) and actors_val != 'nan':
-                actors = [a.strip() for a in actors_val.split(',') if a.strip()]
-                all_actors.update(actors)
-
-            # Режиссеры
-            directors_val = row.get('directors_ru', row.get('directors', ''))
-            if directors_val and pd.notna(directors_val) and isinstance(directors_val, str) and directors_val != 'nan':
-                directors = [d.strip() for d in directors_val.split(',') if d.strip()]
-                all_directors.update(directors)
-
-        # Жанры (уже есть в genres_ru)
-        for movie in movies:
-            all_genres.update(movie.get('genres', []))
-
-        filters_data['genres_flat'] = sorted(list(all_genres))
-        filters_data['years'] = sorted(list(all_years), reverse=True)
-        filters_data['countries'] = sorted(list(all_countries))
-        filters_data['actors'] = sorted(list(all_actors))[:100]  # Ограничиваем для производительности
-        filters_data['directors'] = sorted(list(all_directors))[:100]
-
-        return jsonify({
-            'movies': movies,
-            'total': len(movies),
-            'filters': filters_data
-        })
+        return jsonify(response_data)
 
     except Exception as e:
         logger.error(f"Ошибка при получении каталога: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+def get_all_movies_for_filters(df, models_provider):
+    """Получение всех фильмов в упрощенном формате для фильтров"""
+    movies = []
+    for _, row in df.iterrows():
+        movie_id = row.get('movie_id')
+        if pd.isna(movie_id):
+            continue
+
+        # Получаем русские названия жанров
+        genres_ru = []
+        genre_val = row.get('genre', '')
+        if genre_val and pd.notna(genre_val):
+            if not isinstance(genre_val, (list, np.ndarray)):
+                genres_en = [g.strip() for g in str(genre_val).split(',') if g.strip()]
+                for genre_en in genres_en:
+                    genre_ru = genre_en
+                    if models_provider and models_provider.genres_df is not None:
+                        if 'title_ru' in models_provider.genres_df.columns:
+                            match = models_provider.genres_df[models_provider.genres_df['title'] == genre_en]
+                            if len(match) > 0:
+                                genre_ru = match.iloc[0]['title_ru']
+                    genres_ru.append(genre_ru)
+
+        movies.append({
+            'movie_id': str(movie_id),
+            'genres': genres_ru,
+            'year': str(row.get('year', '')) if pd.notna(row.get('year')) else None,
+            'countries': [c.strip() for c in str(row.get('country', '')).split(',') if c.strip()] if pd.notna(
+                row.get('country')) else [],
+            'actors': [a.strip() for a in str(row.get('actors_ru', row.get('actors', ''))).split(',') if
+                       a.strip()] if pd.notna(row.get('actors_ru')) else [],
+            'directors': [d.strip() for d in str(row.get('directors_ru', row.get('directors', ''))).split(',') if
+                          d.strip()] if pd.notna(row.get('directors_ru')) else []
+        })
+
+    return movies
+
+
+def get_filters_data_cached(movies_df, genres_df):
+    """Получение данных для фильтров с простым кэшированием"""
+    # Простое кэширование в словаре
+    cache_key = 'filters_data'
+    if not hasattr(get_filters_data_cached, 'cache'):
+        get_filters_data_cached.cache = {}
+
+    if cache_key in get_filters_data_cached.cache:
+        return get_filters_data_cached.cache[cache_key]
+
+    filters_data = {
+        'genres_flat': [],
+        'years': [],
+        'countries': [],
+        'actors': [],
+        'directors': []
+    }
+
+    # Собираем уникальные значения
+    all_genres = set()
+    all_years = set()
+    all_countries = set()
+    all_actors = set()
+    all_directors = set()
+
+    for _, row in movies_df.iterrows():
+        # Годы
+        year_val = row.get('year')
+        if year_val and pd.notna(year_val):
+            try:
+                year_int = int(float(year_val))
+                if 1900 <= year_int <= 2030:
+                    all_years.add(year_int)
+            except:
+                pass
+
+        # Страны
+        country_val = row.get('country')
+        if country_val and pd.notna(country_val) and isinstance(country_val, str):
+            countries = [c.strip() for c in country_val.split(',') if c.strip()]
+            all_countries.update(countries)
+
+        # Актеры (ограничиваем количество)
+        actors_val = row.get('actors_ru', row.get('actors', ''))
+        if actors_val and pd.notna(actors_val) and isinstance(actors_val, str) and actors_val != 'nan':
+            actors = [a.strip() for a in actors_val.split(',') if a.strip()]
+            all_actors.update(actors)
+
+        # Режиссеры
+        directors_val = row.get('directors_ru', row.get('directors', ''))
+        if directors_val and pd.notna(directors_val) and isinstance(directors_val, str) and directors_val != 'nan':
+            directors = [d.strip() for d in directors_val.split(',') if d.strip()]
+            all_directors.update(directors)
+
+        # Жанры из строки genre
+        genre_val = row.get('genre', '')
+        if genre_val and pd.notna(genre_val) and isinstance(genre_val, str):
+            genres_en = [g.strip() for g in genre_val.split(',') if g.strip()]
+            for genre_en in genres_en:
+                genre_ru = genre_en
+                if genres_df is not None:
+                    if 'title_ru' in genres_df.columns:
+                        match = genres_df[genres_df['title'] == genre_en]
+                        if len(match) > 0:
+                            genre_ru = match.iloc[0]['title_ru']
+                    elif 'genre_ru' in genres_df.columns:
+                        match = genres_df[genres_df['genre_en'] == genre_en]
+                        if len(match) > 0:
+                            genre_ru = match.iloc[0]['genre_ru']
+                all_genres.add(genre_ru)
+
+    filters_data['genres_flat'] = sorted(list(all_genres))
+    filters_data['years'] = sorted(list(all_years), reverse=True)
+    filters_data['countries'] = sorted(list(all_countries))
+    # Ограничиваем количество для производительности
+    filters_data['actors'] = sorted(list(all_actors))[:100]
+    filters_data['directors'] = sorted(list(all_directors))[:100]
+
+    # Сохраняем в кэш
+    get_filters_data_cached.cache[cache_key] = filters_data
+
+    return filters_data
+
+
+def apply_filters_on_server(df, filters):
+    """Применение фильтров на сервере"""
+    if not filters:
+        return df
+
+    result = df.copy()
+
+    # Фильтр по жанрам
+    if filters.get('genres') and len(filters['genres']) > 0:
+        genre_filter = filters['genres']
+        # Создаем маску для жанров
+        genre_mask = pd.Series([False] * len(result))
+        for genre in genre_filter:
+            genre_mask = genre_mask | result['genre'].astype(str).str.contains(genre, case=False, na=False)
+        result = result[genre_mask]
+
+    # Фильтр по годам
+    if filters.get('years') and len(filters['years']) > 0:
+        years = [int(y) for y in filters['years']]
+        result = result[result['year'].apply(
+            lambda x: int(x) in years if pd.notna(x) and str(x).isdigit() else False
+        )]
+
+    # Фильтр по странам
+    if filters.get('countries') and len(filters['countries']) > 0:
+        countries = filters['countries']
+        country_mask = pd.Series([False] * len(result))
+        for country in countries:
+            country_mask = country_mask | result['country'].astype(str).str.contains(country, case=False, na=False)
+        result = result[country_mask]
+
+    # Фильтр по актерам
+    if filters.get('actors') and len(filters['actors']) > 0:
+        actors = filters['actors']
+        actor_mask = pd.Series([False] * len(result))
+        for actor in actors:
+            actor_mask = actor_mask | result['actors'].astype(str).str.contains(actor, case=False, na=False)
+            if 'actors_ru' in result.columns:
+                actor_mask = actor_mask | result['actors_ru'].astype(str).str.contains(actor, case=False, na=False)
+        result = result[actor_mask]
+
+    # Фильтр по режиссерам
+    if filters.get('directors') and len(filters['directors']) > 0:
+        directors = filters['directors']
+        director_mask = pd.Series([False] * len(result))
+        for director in directors:
+            director_mask = director_mask | result['directors'].astype(str).str.contains(director, case=False, na=False)
+            if 'directors_ru' in result.columns:
+                director_mask = director_mask | result['directors_ru'].astype(str).str.contains(director, case=False,
+                                                                                                na=False)
+        result = result[director_mask]
+
+    return result
+
+
+def apply_sorting_on_server(df, sort_by):
+    """Применение сортировки на сервере"""
+    if sort_by == 'rating_desc':
+        return df.sort_values('imdb', ascending=False, na_position='last')
+    elif sort_by == 'rating_asc':
+        return df.sort_values('imdb', ascending=True, na_position='last')
+    elif sort_by == 'year_desc':
+        return df.sort_values('year', ascending=False, na_position='last')
+    elif sort_by == 'year_asc':
+        return df.sort_values('year', ascending=True, na_position='last')
+    elif sort_by == 'title_asc':
+        return df.sort_values('title_ru', ascending=True, na_position='last')
+    elif sort_by == 'title_desc':
+        return df.sort_values('title_ru', ascending=False, na_position='last')
+    return df
 
 
 @app.route('/api/movies/<path:movie_id>', methods=['GET'])

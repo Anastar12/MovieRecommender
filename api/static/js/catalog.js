@@ -1,9 +1,14 @@
+// catalog.js - исправленная версия с бесконечной прокруткой
 // Каталог фильмов
-let allMovies = [];
-let filteredMovies = [];
-let currentPage = 1;
-let itemsPerPage = 20;
+let allMoviesForFilters = [];   // Отдельный массив для фильтров
+let loadedMovies = [];          // Загруженные фильмы
+let currentOffset = 0;
+let totalMoviesCount = 0;
+let isLoadingMore = false;
+let isLoadingInitial = false;
 let filtersModal = null;
+let currentSort = 'rating_desc';
+let observer = null; // Храним ссылку на observer
 
 // Состояние фильтров
 let filters = {
@@ -16,14 +21,19 @@ let filters = {
 
 // Доступные опции для фильтров
 let availableFilters = {
-    genres: [],
+    genres_tree: [],
+    genres_flat: [],
     years: [],
     countries: [],
     actors: [],
     directors: []
 };
 
-let genreMapping = {};
+// Количество фильмов за одну загрузку
+const LOAD_BATCH_SIZE = 20;
+
+// Флаг, показывающий, что больше нет данных для загрузки
+let hasMoreData = true;
 
 // Инициализация при загрузке страницы
 document.addEventListener('DOMContentLoaded', function() {
@@ -32,66 +42,353 @@ document.addEventListener('DOMContentLoaded', function() {
     if (modalElement) {
         filtersModal = new bootstrap.Modal(modalElement);
     }
-    loadCatalog();
+    initCatalog();
     setupSearchListeners();
 });
 
-function loadCatalog() {
-    console.log('Загрузка каталога...');
+function setupInfiniteScroll() {
+    // Отключаем предыдущий observer, если есть
+    if (observer) {
+        observer.disconnect();
+        observer = null;
+    }
 
-    fetch('/api/catalog')
-        .then(response => {
-            console.log('Ответ получен, статус:', response.status);
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    // Находим сторожевой элемент
+    const sentinel = document.getElementById('scroll-sentinel');
+    if (!sentinel) {
+        console.log('Сторожевой элемент не найден, пропускаем настройку');
+        return;
+    }
+
+    console.log('Настройка бесконечной прокрутки...');
+
+    // Создаем новый observer
+    observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting && !isLoadingMore && hasMoreData && currentOffset < totalMoviesCount) {
+                console.log('Достигнут конец списка, загружаем еще фильмы...');
+                loadMovies(false);
             }
-            return response.json();
-        })
-        .then(data => {
-            console.log('Данные получены:', data);
+        });
+    }, { threshold: 0.1, rootMargin: '200px' });
 
-            if (data.error) {
-                throw new Error(data.error);
+    observer.observe(sentinel);
+}
+
+async function initCatalog() {
+    // Сбрасываем все данные
+    currentOffset = 0;
+    loadedMovies = [];
+    totalMoviesCount = 0;
+    hasMoreData = true;
+
+    // Отключаем старый observer
+    if (observer) {
+        observer.disconnect();
+        observer = null;
+    }
+
+    // Очищаем контейнер полностью
+    const container = document.getElementById('movies-container');
+    if (container) {
+        container.innerHTML = '<div class="loading text-center p-5"><i class="fas fa-spinner fa-spin fa-3x"></i><p class="mt-3">Загрузка фильмов...</p></div>';
+    }
+
+    // Загружаем первую порцию
+    await loadMovies(true);
+}
+
+async function loadMovies(isInitial = false) {
+    if (isInitial) {
+        if (isLoadingInitial) return;
+        isLoadingInitial = true;
+    } else {
+        if (isLoadingMore) return;
+        isLoadingMore = true;
+        showLoadMoreIndicator(true);
+    }
+
+    try {
+        const params = new URLSearchParams({
+            offset: currentOffset,
+            limit: LOAD_BATCH_SIZE,
+            sort_by: currentSort,
+            filters: JSON.stringify(filters)
+        });
+
+        console.log(`Загрузка фильмов: offset=${currentOffset}, limit=${LOAD_BATCH_SIZE}`);
+        const response = await fetch(`/api/catalog?${params}`);
+        const data = await response.json();
+
+        if (data.error) throw new Error(data.error);
+
+        // При первом запросе сохраняем общее количество и фильтры
+        if (isInitial) {
+            totalMoviesCount = data.total;
+            console.log(`Всего фильмов: ${totalMoviesCount}`);
+
+            // Сохраняем все фильмы для фильтров (один раз)
+            if (data.all_movies_for_filters) {
+                allMoviesForFilters = data.all_movies_for_filters;
             }
 
-            if (data.movies && data.movies.length > 0) {
-                allMovies = data.movies;
-                availableFilters = data.filters || {
-                    genres_tree: [],
-                    genres_flat: [],
-                    years: [],
-                    countries: [],
-                    actors: [],
-                    directors: []
-                };
+            if (data.filters) {
+                availableFilters = data.filters;
                 renderFilterOptions();
-                filteredMovies = [...allMovies];
-                displayMovies();
+            }
+
+            // Обновляем счетчик найденных фильмов
+            const resultsCount = document.getElementById('results-count');
+            if (resultsCount) resultsCount.textContent = totalMoviesCount;
+        }
+
+        // Добавляем новые фильмы (только если они есть и не дублируются)
+        if (data.movies && data.movies.length > 0) {
+            console.log(`Получено ${data.movies.length} фильмов`);
+
+            // Проверяем на дубликаты перед добавлением
+            const existingIds = new Set(loadedMovies.map(m => m.movie_id));
+            const newMovies = data.movies.filter(m => !existingIds.has(m.movie_id));
+
+            if (newMovies.length > 0) {
+                loadedMovies = [...loadedMovies, ...newMovies];
+                displayMovies(loadedMovies);
+            }
+
+            // Обновляем offset
+            currentOffset += data.movies.length;
+            console.log(`Загружено ${loadedMovies.length} из ${totalMoviesCount} фильмов`);
+
+            // Проверяем, есть ли еще данные
+            if (currentOffset >= totalMoviesCount) {
+                hasMoreData = false;
+                showEndOfListIndicator();
             } else {
-                document.getElementById('movies-container').innerHTML = `
-                    <div class="alert alert-warning text-center p-5">
-                        <i class="fas fa-exclamation-triangle fa-3x mb-3"></i>
-                        <p>Фильмы не найдены в базе данных</p>
-                        <small>Проверьте наличие данных в recommender.movies_df</small>
+                // Убеждаемся, что сторожевой элемент есть и observer настроен
+                setTimeout(() => {
+                    setupInfiniteScroll();
+                }, 100);
+            }
+        } else {
+            hasMoreData = false;
+            showEndOfListIndicator();
+            if (isInitial) {
+                displayMovies([]);
+            }
+        }
+
+    } catch (error) {
+        console.error('Ошибка загрузки:', error);
+        if (isInitial) {
+            const container = document.getElementById('movies-container');
+            if (container) {
+                container.innerHTML = `
+                    <div class="alert alert-danger text-center p-5">
+                        <i class="fas fa-exclamation-circle fa-3x mb-3"></i>
+                        <p>Ошибка при загрузке: ${error.message}</p>
+                        <button class="btn btn-outline-danger" onclick="initCatalog()">Повторить</button>
                     </div>
                 `;
             }
-        })
-        .catch(error => {
-            console.error('Ошибка загрузки каталога:', error);
-            document.getElementById('movies-container').innerHTML = `
-                <div class="alert alert-danger text-center p-5">
-                    <i class="fas fa-exclamation-circle fa-3x mb-3"></i>
-                    <p>Ошибка при загрузке каталога</p>
-                    <small>${error.message}</small>
-                    <div class="mt-3">
-                        <button class="btn btn-outline-danger" onclick="loadCatalog()">
-                            <i class="fas fa-sync"></i> Попробовать снова
-                        </button>
+        } else {
+            if (typeof showToast === 'function') {
+                showToast('Ошибка загрузки', error.message, 'error');
+            }
+        }
+        // В случае ошибки все равно пытаемся показать сторожевой элемент
+        hasMoreData = false;
+    } finally {
+        if (isInitial) {
+            isLoadingInitial = false;
+        } else {
+            isLoadingMore = false;
+            showLoadMoreIndicator(false);
+        }
+    }
+}
+
+function showLoadMoreIndicator(show) {
+    const indicator = document.getElementById('loading-indicator');
+    if (indicator) {
+        indicator.style.display = show ? 'block' : 'none';
+    }
+}
+
+function showEndOfListIndicator() {
+    const endIndicator = document.getElementById('end-of-list');
+    if (endIndicator) {
+        endIndicator.style.display = 'block';
+    }
+    // Отключаем observer, если достигнут конец
+    if (observer) {
+        observer.disconnect();
+        observer = null;
+    }
+    // Скрываем сторожевой элемент
+    const sentinel = document.getElementById('scroll-sentinel');
+    if (sentinel) {
+        sentinel.style.display = 'none';
+    }
+}
+
+// Функция для обратной совместимости
+function loadMoreMovies() {
+    if (!isLoadingMore && hasMoreData && currentOffset < totalMoviesCount) {
+        loadMovies(false);
+    }
+}
+
+function displayMovies(movies) {
+    const container = document.getElementById('movies-container');
+    if (!container) return;
+
+    if (!movies || movies.length === 0) {
+        container.innerHTML = '<div class="no-results"><i class="fas fa-film fa-3x mb-3"></i><p>Фильмы не найдены</p></div>';
+        return;
+    }
+
+    // Строим HTML для всех загруженных фильмов
+    let html = '<div class="row">';
+    movies.forEach(movie => {
+        const posterUrl = movie.poster ? `/img/horizontal/${movie.poster}` : '/img/horizontal/placeholder.jpg';
+        const rating = movie.imdb_rating ? `<i class="fas fa-star"></i> ${movie.imdb_rating.toFixed(1)}` : '';
+        const displayTitle = movie.title_ru || movie.title;
+        const displayGenres = movie.genres?.slice(0, 2).join(', ') || 'Жанр не указан';
+
+        html += `
+            <div class="col-md-4 col-lg-3 movie-card" onclick="showMovieDetails('${movie.movie_id}')">
+                <div class="card h-100">
+                    <div class="image-container">
+                        <img src="${posterUrl}" class="card-img-top" alt="${escapeHtml(displayTitle)}"
+                             loading="lazy" onerror="this.src='/img/horizontal/placeholder.jpg'">
+                    </div>
+                    <div class="card-body">
+                        <div class="movie-title">${escapeHtml(displayTitle)}</div>
+                        <div class="movie-year">${movie.year || 'Год не указан'}</div>
+                        <div class="movie-genre">${escapeHtml(displayGenres)}</div>
+                        ${rating ? `<div class="movie-rating">${rating}</div>` : ''}
                     </div>
                 </div>
-            `;
-        });
+            </div>
+        `;
+    });
+    html += '</div>';
+
+    // Добавляем индикаторы загрузки и конца списка
+    html += `
+        <div id="loading-indicator" class="text-center p-3" style="display: none;">
+            <i class="fas fa-spinner fa-spin"></i> Загрузка...
+        </div>
+        <div id="end-of-list" class="text-center p-3 text-muted" style="display: none;">
+            <i class="fas fa-check-circle"></i> Вы просмотрели все фильмы
+        </div>
+        <div id="scroll-sentinel" style="height: 10px;"></div>
+    `;
+
+    container.innerHTML = html;
+
+    // Настраиваем бесконечную прокрутку после добавления элементов
+    setTimeout(() => {
+        setupInfiniteScroll();
+    }, 100);
+}
+
+// Остальные функции (applyFilters, changeSort, resetFilters, removeFilter,
+// renderGenreTree, handleMainGenreChange, handleSubgenreChange, toggleSubgenres,
+// filterGenreList, renderFilterOptions, renderCheckboxList, toggleFilterFromModal,
+// findGenreInTree, updateAllGenreCheckboxesState, updateFiltersCount,
+// applyFiltersAndClose, updateSelectedFiltersDisplay, getFilterTypeName,
+// openFiltersModal, getItemCount, setupSearchListeners, filterList, escapeHtml)
+// остаются без изменений, они такие же как в предыдущей версии
+
+function applyFilters() {
+    // Полностью перезагружаем каталог с новыми фильтрами
+    initCatalog();
+    updateSelectedFiltersDisplay();
+    if (filtersModal) filtersModal.hide();
+}
+
+function changeSort() {
+    const sortSelect = document.getElementById('sort-by');
+    if (sortSelect) {
+        currentSort = sortSelect.value;
+    }
+    // Полностью перезагружаем с новой сортировкой
+    initCatalog();
+}
+
+function resetFilters() {
+    filters = {
+        genres: [],
+        years: [],
+        countries: [],
+        actors: [],
+        directors: []
+    };
+
+    // Сбрасываем все чекбоксы в модальном окне
+    const modalCheckboxes = document.querySelectorAll('#filtersModal input[type="checkbox"]');
+    modalCheckboxes.forEach(cb => {
+        cb.checked = false;
+        cb.indeterminate = false;
+    });
+
+    // Перезагружаем каталог
+    initCatalog();
+    updateSelectedFiltersDisplay();
+    updateFiltersCount();
+
+    if (filtersModal) filtersModal.hide();
+}
+
+function removeFilter(type, value) {
+    if (!filters[type]) {
+        console.error('Неизвестный тип фильтра:', type);
+        return;
+    }
+
+    const index = filters[type].indexOf(value);
+    if (index !== -1) {
+        filters[type].splice(index, 1);
+    }
+
+    if (type === 'genres' && availableFilters.genres_tree) {
+        const checkbox = document.querySelector(`#genre-list input[value="${value.replace(/"/g, '\\"')}"]`);
+        if (checkbox) {
+            checkbox.checked = false;
+            checkbox.indeterminate = false;
+        }
+
+        const genreInfo = findGenreInTree(availableFilters.genres_tree, value);
+        if (genreInfo && !genreInfo.isMain && genreInfo.parentName) {
+            const parentCheckboxId = `genre_${genreInfo.parentName.replace(/[^a-zA-Z0-9а-яА-ЯёЁ]/g, '_')}`;
+            const parentCheckbox = document.getElementById(parentCheckboxId);
+            if (parentCheckbox) {
+                const parentInfo = findGenreInTree(availableFilters.genres_tree, genreInfo.parentName);
+                if (parentInfo && parentInfo.isMain && parentInfo.subgenres) {
+                    let anySubSelected = false;
+                    parentInfo.subgenres.forEach(sub => {
+                        if (filters.genres.includes(sub.name)) {
+                            anySubSelected = true;
+                        }
+                    });
+
+                    if (!anySubSelected) {
+                        parentCheckbox.checked = false;
+                        parentCheckbox.indeterminate = false;
+                    } else {
+                        parentCheckbox.indeterminate = true;
+                        parentCheckbox.checked = false;
+                    }
+                }
+            }
+        }
+
+        updateAllGenreCheckboxesState();
+    }
+
+    // Перезагружаем каталог
+    initCatalog();
 }
 
 function renderGenreTree(genresTree, selectedGenres) {
@@ -203,10 +500,10 @@ function handleMainGenreChange(genreName, checkboxElement) {
                 const subgenreName = subgenre.name;
                 if (!filters.genres.includes(subgenreName)) {
                     filters.genres.push(subgenreName);
-                    const subCheckboxId = `subgenre_${subgenreName.replace(/[^a-zA-Z0-9а-яА-ЯёЁ]/g, '_')}`;
-                    const subCheckbox = document.getElementById(subCheckboxId);
-                    if (subCheckbox) subCheckbox.checked = true;
                 }
+                const subCheckboxId = `subgenre_${subgenreName.replace(/[^a-zA-Z0-9а-яА-ЯёЁ]/g, '_')}`;
+                const subCheckbox = document.getElementById(subCheckboxId);
+                if (subCheckbox) subCheckbox.checked = true;
             });
         } else {
             const mainIndex = filters.genres.indexOf(genreName);
@@ -235,7 +532,6 @@ function handleMainGenreChange(genreName, checkboxElement) {
         }
     }
 
-    console.log('Фильтры после изменения:', filters);
     updateFiltersCount();
 }
 
@@ -287,7 +583,6 @@ function handleSubgenreChange(subgenreName, parentGenreName, checkboxElement) {
         }
     }
 
-    console.log('Фильтры после изменения:', filters);
     updateFiltersCount();
 }
 
@@ -344,8 +639,6 @@ function filterGenreList(searchTerm) {
 }
 
 function renderFilterOptions() {
-    console.log('Рендеринг фильтров...');
-
     if (availableFilters.genres_tree && availableFilters.genres_tree.length > 0) {
         renderGenreTree(availableFilters.genres_tree, filters.genres);
         setTimeout(() => {
@@ -431,78 +724,7 @@ function renderCheckboxList(containerId, items, selectedItems, type) {
     container.innerHTML = html;
 }
 
-function getItemCount(type, item) {
-    if (!allMovies || allMovies.length === 0) return 0;
-
-    if (type === 'genre') {
-        let isParentGenre = false;
-        let subgenresList = [];
-
-        if (availableFilters.genres_tree) {
-            const genreInfo = findGenreInTree(availableFilters.genres_tree, item);
-            if (genreInfo && genreInfo.isMain && genreInfo.subgenres && genreInfo.subgenres.length > 0) {
-                isParentGenre = true;
-                subgenresList = genreInfo.subgenres.map(sub => sub.name);
-            }
-        }
-
-        if (isParentGenre) {
-            const movieIdsWithSubgenres = new Set();
-            allMovies.forEach(movie => {
-                if (movie.genres && movie.genres.length > 0) {
-                    const hasSubgenre = movie.genres.some(genre => subgenresList.includes(genre));
-                    if (hasSubgenre) {
-                        movieIdsWithSubgenres.add(movie.movie_id);
-                    }
-                }
-            });
-            return movieIdsWithSubgenres.size;
-        } else {
-            return allMovies.filter(movie => {
-                return movie.genres && movie.genres.includes(item);
-            }).length;
-        }
-    }
-
-    if (type === 'year') {
-        return allMovies.filter(movie => {
-            if (!movie.year_range && !movie.year) return false;
-            const yearNum = parseInt(item);
-            if (isNaN(yearNum)) return false;
-            if (movie.year_range) {
-                return yearNum >= movie.year_range.start && yearNum <= movie.year_range.end;
-            } else if (movie.year) {
-                const movieYearNum = parseInt(movie.year);
-                return !isNaN(movieYearNum) && movieYearNum === yearNum;
-            }
-            return false;
-        }).length;
-    }
-
-    if (type === 'country') {
-        return allMovies.filter(movie => {
-            return movie.countries && movie.countries.includes(item);
-        }).length;
-    }
-
-    if (type === 'actor') {
-        return allMovies.filter(movie => {
-            return movie.actors && movie.actors.includes(item);
-        }).length;
-    }
-
-    if (type === 'director') {
-        return allMovies.filter(movie => {
-            return movie.directors && movie.directors.includes(item);
-        }).length;
-    }
-
-    return 0;
-}
-
 function toggleFilterFromModal(type, value) {
-    console.log('toggleFilterFromModal вызван:', type, value);
-
     if (!filters[type]) {
         console.error('Неизвестный тип фильтра:', type);
         return;
@@ -582,7 +804,6 @@ function toggleFilterFromModal(type, value) {
         }
     }
 
-    console.log('Фильтры после изменения:', filters);
     updateFiltersCount();
 
     if (type === 'genres' && availableFilters.genres_tree) {
@@ -617,48 +838,6 @@ function findGenreInTree(genresTree, genreName, parent = null, parentName = null
         }
     }
     return null;
-}
-
-function updateParentGenreState(parentGenre, parentName) {
-    if (!parentGenre || !parentGenre.subgenres) return;
-
-    let allSubgenresSelected = true;
-    let anySubgenreSelected = false;
-
-    for (const subgenre of parentGenre.subgenres) {
-        const isSelected = filters.genres.includes(subgenre.name);
-        if (!isSelected) {
-            allSubgenresSelected = false;
-        }
-        if (isSelected) {
-            anySubgenreSelected = true;
-        }
-    }
-
-    const parentCheckboxId = `genre_${parentName.replace(/[^a-zA-Z0-9]/g, '_')}`;
-    const parentCheckbox = document.getElementById(parentCheckboxId);
-
-    if (parentCheckbox) {
-        if (allSubgenresSelected && anySubgenreSelected) {
-            if (!filters.genres.includes(parentName)) {
-                filters.genres.push(parentName);
-                parentCheckbox.checked = true;
-            }
-        } else if (!anySubgenreSelected) {
-            const parentIndex = filters.genres.indexOf(parentName);
-            if (parentIndex !== -1) {
-                filters.genres.splice(parentIndex, 1);
-                parentCheckbox.checked = false;
-            }
-        } else {
-            const parentIndex = filters.genres.indexOf(parentName);
-            if (parentIndex !== -1) {
-                filters.genres.splice(parentIndex, 1);
-                parentCheckbox.checked = false;
-            }
-            parentCheckbox.indeterminate = true;
-        }
-    }
 }
 
 function updateAllGenreCheckboxesState() {
@@ -696,14 +875,6 @@ function updateAllGenreCheckboxesState() {
     }
 }
 
-function updateGenreCheckboxesState() {
-    const checkboxes = document.querySelectorAll('#genre-list input[type="checkbox"]');
-    checkboxes.forEach(cb => {
-        const value = cb.value;
-        cb.checked = filters.genres.includes(value);
-    });
-}
-
 function updateFiltersCount() {
     let totalCount = 0;
     for (const [type, values] of Object.entries(filters)) {
@@ -713,11 +884,13 @@ function updateFiltersCount() {
     }
 
     const filtersCountSpan = document.getElementById('filters-count');
-    if (totalCount > 0) {
-        filtersCountSpan.style.display = 'inline-block';
-        filtersCountSpan.textContent = totalCount;
-    } else {
-        filtersCountSpan.style.display = 'none';
+    if (filtersCountSpan) {
+        if (totalCount > 0) {
+            filtersCountSpan.style.display = 'inline-block';
+            filtersCountSpan.textContent = totalCount;
+        } else {
+            filtersCountSpan.style.display = 'none';
+        }
     }
 }
 
@@ -726,121 +899,11 @@ function applyFiltersAndClose() {
     if (filtersModal) filtersModal.hide();
 }
 
-function applyFilters() {
-    console.log('Применяем фильтры:', filters);
-    console.log('Всего фильмов до фильтрации:', allMovies.length);
-
-    if (!allMovies || allMovies.length === 0) {
-        filteredMovies = [];
-        displayMovies();
-        return;
-    }
-
-    filteredMovies = allMovies.filter(movie => {
-        if (filters.genres.length > 0) {
-            if (!movie.genres_en || movie.genres_en.length === 0) return false;
-
-            let expandedGenres = [...filters.genres];
-
-            if (availableFilters.genres_tree) {
-                filters.genres.forEach(genre => {
-                    const genreInfo = findGenreInTree(availableFilters.genres_tree, genre);
-                    if (genreInfo && genreInfo.isMain && genreInfo.subgenres && genreInfo.subgenres.length > 0) {
-                        genreInfo.subgenres.forEach(subgenre => {
-                            if (!expandedGenres.includes(subgenre.name)) {
-                                expandedGenres.push(subgenre.name);
-                            }
-                        });
-                    }
-                });
-            }
-
-            const hasGenre = expandedGenres.some(genreRu => {
-                const genreEn = genreMapping[genreRu] || genreRu;
-                return movie.genres_en.includes(genreEn);
-            });
-
-            if (!hasGenre) return false;
-        }
-
-        if (filters.years.length > 0) {
-            if (!movie.year_range && !movie.year) return false;
-
-            let movieYearRange = movie.year_range;
-
-            if (movieYearRange) {
-                const hasMatchingYear = filters.years.some(filterYear => {
-                    const yearNum = parseInt(filterYear);
-                    if (isNaN(yearNum)) return false;
-                    return yearNum >= movieYearRange.start && yearNum <= movieYearRange.end;
-                });
-                if (!hasMatchingYear) return false;
-            } else if (movie.year) {
-                const movieYear = parseInt(movie.year);
-                if (isNaN(movieYear)) return false;
-                const hasMatchingYear = filters.years.some(filterYear => {
-                    const yearNum = parseInt(filterYear);
-                    return !isNaN(yearNum) && movieYear === yearNum;
-                });
-                if (!hasMatchingYear) return false;
-            } else {
-                return false;
-            }
-        }
-
-        if (filters.countries.length > 0) {
-            if (!movie.countries || movie.countries.length === 0) return false;
-            const hasCountry = filters.countries.some(c => movie.countries.includes(c));
-            if (!hasCountry) return false;
-        }
-
-        if (filters.actors.length > 0) {
-            if (!movie.actors || movie.actors.length === 0) return false;
-            const hasActor = filters.actors.some(a => movie.actors.includes(a));
-            if (!hasActor) return false;
-        }
-
-        if (filters.directors.length > 0) {
-            if (!movie.directors || movie.directors.length === 0) return false;
-            const hasDirector = filters.directors.some(d => movie.directors.includes(d));
-            if (!hasDirector) return false;
-        }
-
-        return true;
-    });
-
-    console.log('Найдено фильмов после фильтрации:', filteredMovies.length);
-
-    currentPage = 1;
-    displayMovies();
-    updateSelectedFiltersDisplay();
-}
-
-function resetFilters() {
-    filters = {
-        genres: [],
-        years: [],
-        countries: [],
-        actors: [],
-        directors: []
-    };
-
-    const modalCheckboxes = document.querySelectorAll('#filtersModal input[type="checkbox"]');
-    modalCheckboxes.forEach(cb => {
-        cb.checked = false;
-        cb.indeterminate = false;
-    });
-
-    filteredMovies = [...allMovies];
-    currentPage = 1;
-    displayMovies();
-    updateSelectedFiltersDisplay();
-    updateFiltersCount();
-}
-
 function updateSelectedFiltersDisplay() {
     const container = document.getElementById('selected-filters');
     const listContainer = document.getElementById('selected-filters-list');
+
+    if (!container || !listContainer) return;
 
     let hasFilters = false;
     let html = '';
@@ -880,182 +943,48 @@ function getFilterTypeName(type) {
     return names[type] || type;
 }
 
-function removeFilter(type, value) {
-    console.log('removeFilter вызван:', type, value);
-
-    if (!filters[type]) {
-        console.error('Неизвестный тип фильтра:', type);
-        return;
-    }
-
-    const index = filters[type].indexOf(value);
-    if (index !== -1) {
-        filters[type].splice(index, 1);
-    }
-
-    if (type === 'genres' && availableFilters.genres_tree) {
-        const checkbox = document.querySelector(`#genre-list input[value="${value.replace(/"/g, '\\"')}"]`);
-        if (checkbox) {
-            checkbox.checked = false;
-            checkbox.indeterminate = false;
-        }
-
-        const genreInfo = findGenreInTree(availableFilters.genres_tree, value);
-        if (genreInfo && !genreInfo.isMain && genreInfo.parentName) {
-            const parentCheckboxId = `genre_${genreInfo.parentName.replace(/[^a-zA-Z0-9а-яА-ЯёЁ]/g, '_')}`;
-            const parentCheckbox = document.getElementById(parentCheckboxId);
-            if (parentCheckbox) {
-                const parentInfo = findGenreInTree(availableFilters.genres_tree, genreInfo.parentName);
-                if (parentInfo && parentInfo.isMain && parentInfo.subgenres) {
-                    let anySubSelected = false;
-                    parentInfo.subgenres.forEach(sub => {
-                        if (filters.genres.includes(sub.name)) {
-                            anySubSelected = true;
-                        }
-                    });
-
-                    if (!anySubSelected) {
-                        parentCheckbox.checked = false;
-                        parentCheckbox.indeterminate = false;
-                    } else {
-                        parentCheckbox.indeterminate = true;
-                        parentCheckbox.checked = false;
-                    }
-                }
-            }
-        }
-
-        updateAllGenreCheckboxesState();
-    }
-
-    applyFilters();
-}
-
 function openFiltersModal() {
     renderFilterOptions();
     if (filtersModal) filtersModal.show();
 }
 
-function displayMovies() {
-    const container = document.getElementById('movies-container');
-    const resultsCount = document.getElementById('results-count');
+function getItemCount(type, item) {
+    if (!allMoviesForFilters || allMoviesForFilters.length === 0) return 0;
 
-    if (!filteredMovies || filteredMovies.length === 0) {
-        container.innerHTML = '<div class="no-results"><i class="fas fa-film fa-3x mb-3"></i><p>Фильмы не найдены</p></div>';
-        document.getElementById('pagination').innerHTML = '';
-        if (resultsCount) resultsCount.textContent = '0';
-        return;
+    if (type === 'genre') {
+        return allMoviesForFilters.filter(movie => {
+            return movie.genres && movie.genres.includes(item);
+        }).length;
     }
 
-    const sortBy = document.getElementById('sort-by')?.value || 'rating_desc';
-    let sorted = [...filteredMovies];
-
-    switch(sortBy) {
-        case 'rating_desc':
-            sorted.sort((a, b) => (b.imdb_rating || 0) - (a.imdb_rating || 0));
-            break;
-        case 'rating_asc':
-            sorted.sort((a, b) => (a.imdb_rating || 0) - (b.imdb_rating || 0));
-            break;
-        case 'year_desc':
-            sorted.sort((a, b) => (b.year || 0) - (a.year || 0));
-            break;
-        case 'year_asc':
-            sorted.sort((a, b) => (a.year || 0) - (b.year || 0));
-            break;
-        case 'title_asc':
-            sorted.sort((a, b) => (a.title_ru || a.title).localeCompare(b.title_ru || b.title));
-            break;
-        case 'title_desc':
-            sorted.sort((a, b) => (b.title_ru || b.title).localeCompare(a.title_ru || a.title));
-            break;
+    if (type === 'year') {
+        return allMoviesForFilters.filter(movie => {
+            if (!movie.year) return false;
+            const yearNum = parseInt(item);
+            const movieYearNum = parseInt(movie.year);
+            return !isNaN(movieYearNum) && movieYearNum === yearNum;
+        }).length;
     }
 
-    if (resultsCount) resultsCount.textContent = sorted.length;
-
-    const totalPages = Math.ceil(sorted.length / itemsPerPage);
-    const start = (currentPage - 1) * itemsPerPage;
-    const end = start + itemsPerPage;
-    const pageMovies = sorted.slice(start, end);
-
-    let html = '<div class="row">';
-    pageMovies.forEach(movie => {
-        const posterUrl = movie.poster ? `/img/horizontal/${movie.poster}` : '/img/horizontal/placeholder.jpg';
-        const rating = movie.imdb_rating ? `IMDb: ${movie.imdb_rating}` : '';
-        const displayTitle = movie.title_ru || movie.title;
-
-        let displayGenres = 'Жанр не указан';
-        if (movie.genres && movie.genres.length > 0) {
-            displayGenres = movie.genres.slice(0, 2).join(', ');
-        } else if (movie.genre_ru) {
-            displayGenres = movie.genre_ru;
-        } else if (movie.genre) {
-            displayGenres = movie.genre;
-        }
-
-        html += `
-            <div class="col-md-4 col-lg-3 movie-card" onclick="showMovieDetails('${movie.movie_id}')">
-                <div class="card h-100">
-                    <div class="image-container">
-                        <img src="${posterUrl}" class="card-img-top" alt="${escapeHtml(displayTitle)}"
-                             loading="lazy"
-                             onerror="this.src='/img/horizontal/placeholder.jpg'">
-                    </div>
-                    <div class="card-body">
-                        <div class="movie-title">${escapeHtml(displayTitle)}</div>
-                        <div class="movie-year">${movie.year || 'Год не указан'}</div>
-                        <div class="movie-genre">${escapeHtml(displayGenres)}</div>
-                        ${rating ? `<div class="movie-rating"><i class="fas fa-star"></i> ${rating}</div>` : ''}
-                    </div>
-                </div>
-            </div>
-        `;
-    });
-    html += '</div>';
-    container.innerHTML = html;
-
-    renderPagination(totalPages);
-}
-
-function renderPagination(totalPages) {
-    const paginationContainer = document.getElementById('pagination');
-    if (totalPages <= 1) {
-        paginationContainer.innerHTML = '';
-        return;
+    if (type === 'country') {
+        return allMoviesForFilters.filter(movie => {
+            return movie.countries && movie.countries.includes(item);
+        }).length;
     }
 
-    let html = '';
-
-    html += `
-        <li class="page-item ${currentPage === 1 ? 'disabled' : ''}">
-            <a class="page-link" href="#" onclick="changePage(${currentPage - 1}); return false;">«</a>
-        </li>
-    `;
-
-    const startPage = Math.max(1, currentPage - 2);
-    const endPage = Math.min(totalPages, currentPage + 2);
-
-    for (let i = startPage; i <= endPage; i++) {
-        html += `
-            <li class="page-item ${i === currentPage ? 'active' : ''}">
-                <a class="page-link" href="#" onclick="changePage(${i}); return false;">${i}</a>
-            </li>
-        `;
+    if (type === 'actor') {
+        return allMoviesForFilters.filter(movie => {
+            return movie.actors && movie.actors.includes(item);
+        }).length;
     }
 
-    html += `
-        <li class="page-item ${currentPage === totalPages ? 'disabled' : ''}">
-            <a class="page-link" href="#" onclick="changePage(${currentPage + 1}); return false;">»</a>
-        </li>
-    `;
+    if (type === 'director') {
+        return allMoviesForFilters.filter(movie => {
+            return movie.directors && movie.directors.includes(item);
+        }).length;
+    }
 
-    paginationContainer.innerHTML = html;
-}
-
-function changePage(page) {
-    currentPage = page;
-    displayMovies();
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    return 0;
 }
 
 function setupSearchListeners() {
@@ -1094,3 +1023,17 @@ function filterList(listId, searchTerm) {
         }
     });
 }
+
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+window.showMovieDetails = window.showMovieDetails || function(movieId) {
+    console.log('Show movie details:', movieId);
+    if (typeof window.loadMovieDetails === 'function') {
+        window.loadMovieDetails(movieId);
+    }
+};

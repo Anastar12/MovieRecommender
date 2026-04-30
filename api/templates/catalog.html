@@ -1,3 +1,4 @@
+<!-- catalog.html - обновленная версия с бесконечной прокруткой -->
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -74,7 +75,7 @@
             </div>
             <div>
                 <label class="me-2">Сортировать:</label>
-                <select id="sort-by" class="sort-select" onchange="displayMovies()">
+                <select id="sort-by" class="sort-select" onchange="changeSort()">
                     <option value="rating_desc">По рейтингу (убывание)</option>
                     <option value="rating_asc">По рейтингу (возрастание)</option>
                     <option value="year_desc">По году (новые)</option>
@@ -93,10 +94,7 @@
             </div>
         </div>
 
-        <!-- Пагинация -->
-        <nav id="pagination-container">
-            <ul class="pagination" id="pagination"></ul>
-        </nav>
+        <!-- Индикаторы загрузки и конца списка добавляются динамически через JS -->
     </div>
 
     <!-- Модальное окно фильтров -->
@@ -108,7 +106,6 @@
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
-
                     <!-- Фильтр по жанрам -->
                     <div class="filter-section">
                         <h5><i class="fas fa-tags"></i> Жанры</h5>
