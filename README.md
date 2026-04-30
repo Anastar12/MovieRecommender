@@ -154,13 +154,18 @@ MovieRecommender/
 │   └── config.py
 ├── offline/
 │   ├── __init__.py
+│   ├── cache_manager.py
 │   ├── data_pipeline.py
+│   ├── ensemble_ranker.py
+│   ├── evaluation_metrics.py
 │   ├── model_trainer.py
-│   └── cache_manager.py
+│   ├── model_versioning.py
+│   └── pre_train_models.py
 ├── online/
 │   ├── __init__.py
 │   ├── context_handler.py
 │   ├── candidate_generator.py
+│   ├── incremental_updater.py
 │   ├── ranker.py
 │   ├── postprocessor.py
 │   └── feedback_logger.py
