@@ -707,7 +707,6 @@ function renderSimilarMovies(movies) {
                 <div class="sim-info">
                     <div class="sim-title">${escapeHtml(simTitle)}</div>
                     <div class="sim-year">${m.year || '—'}</div>
-                    <div class="sim-badge"><i class="fas fa-chart-line"></i> схожесть ${similarityPercent}%</div>
                 </div>
             </div>
         `;

@@ -999,64 +999,28 @@ class ModelsProvider:
             return []
 
         try:
-            # Проверяем наличие movie_ids и combined_features
-            if not hasattr(self, 'movie_ids') or self.movie_ids is None:
-                logger.warning("movie_ids не загружены")
-                return []
-
-            if not hasattr(self, 'combined_features') or self.combined_features is None:
-                logger.warning("combined_features не загружены")
-                return []
-
-            # Находим индекс фильма
-            movie_id_str = str(movie_id)
-            if movie_id_str not in self.movie_ids:
-                # Пробуем найти по частичному совпадению
-                for mid in self.movie_ids:
-                    if movie_id_str in str(mid):
-                        movie_idx = self.movie_ids.index(mid)
-                        break
-                else:
-                    logger.debug(f"Фильм {movie_id} не найден в индексах")
-                    return []
-            else:
-                movie_idx = self.movie_ids.index(movie_id_str)
-
-            if movie_idx >= self.combined_features.shape[0]:
-                logger.warning(f"Индекс {movie_idx} вне диапазона combined_features")
+            movie_idx = self.data.movie_ids.index(movie_id) if hasattr(self.data, 'movie_ids') else None
+            if movie_idx is None:
                 return []
 
             distances, indices = self.trainer.nn_model.kneighbors(
-                self.combined_features[movie_idx],
+                self.data.combined_features[movie_idx],
                 n_neighbors=n + 1
             )
 
             recommendations = []
             for i, idx in enumerate(indices[0][1:]):
-                if idx < len(self.movie_ids):
-                    movie_id_result = self.movie_ids[idx]
-                    if self.movies_df is not None:
-                        movie = self.movies_df[self.movies_df['movie_id'] == movie_id_result]
-                        if len(movie) > 0:
-                            recommendations.append({
-                                'movie_id': movie_id_result,
-                                'title': movie.iloc[0].get('title', ''),
-                                'year': movie.iloc[0].get('year', ''),
-                                'similarity': float(1 - distances[0][i + 1])
-                            })
-                        else:
-                            recommendations.append({
-                                'movie_id': movie_id_result,
-                                'title': str(movie_id_result),
-                                'year': '',
-                                'similarity': float(1 - distances[0][i + 1])
-                            })
+                movie = self.movies_df.iloc[idx]
+                recommendations.append({
+                    'movie_id': movie['movie_id'],
+                    'title': movie['title'],
+                    'year': movie['year'],
+                    'similarity': 1 - distances[0][i + 1]
+                })
 
             return recommendations
         except Exception as e:
             logger.error(f"Ошибка поиска похожих: {e}")
-            import traceback
-            traceback.print_exc()
             return []
 
     def get_russian_genre(self, genre_en):
@@ -1423,6 +1387,25 @@ class DataProvider:
 
                     if not title:
                         movies_without_details.append(movie_id)
+
+                    # Проверяем, есть ли хоть какое-то название (русское или английское)
+                    has_title = (
+                            details.get('title') and
+                            details.get('title') != '' and
+                            details.get('title') != 'nan' and
+                            not details.get('title', '').startswith('Фильм tt')  # Исключаем заглушки
+                    )
+                    has_title_ru = (
+                            details.get('title_ru') and
+                            details.get('title_ru') != '' and
+                            details.get('title_ru') != 'nan' and
+                            not details.get('title_ru', '').startswith('Фильм tt')
+                    )
+
+                    # Если нет названия - пропускаем фильм
+                    if not has_title and not has_title_ru:
+                        logger.debug(f"Пропущен фильм {movie_id} - нет названия")
+                        continue
 
                 # Добавляем пользовательскую информацию
                 rating = item.get('rating')
